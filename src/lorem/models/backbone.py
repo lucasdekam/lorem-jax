@@ -258,11 +258,13 @@ class QuadraticReadout(nn.Module):
     """
 
     features: int
-    # Where kappa starts, as softplus(bias). Callers pass this in rather than
-    # hardcoding it: see `Lorem.kappa_target`, which turns a physical
-    # d2E/dq2 into a per-atom, per-readout-site value. It is a learnable
-    # parameter, so this only sets where training starts.
-    kappa_bias_init: float = -3.5
+    # Where kappa starts, as softplus(bias). Zero is the neutral default: it
+    # encodes no assumption about system size or dataset, and callers who care
+    # pass a value in. `Lorem.kappa_target` is the one that does, turning a
+    # physical d2E/dq2 into a per-atom, per-readout-site bias. A dataset-tuned
+    # constant here would silently follow the module into systems it was never
+    # calibrated for. Learnable either way, so this only sets a starting point.
+    kappa_bias_init: float = 0.0
 
     @nn.compact
     def __call__(self, Q_i, x, atom_mask):
