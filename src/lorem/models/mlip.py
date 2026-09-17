@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 import e3x
 import flax.linen as nn
@@ -47,6 +48,16 @@ class Lorem(nn.Module):
     #                    no longer exactly quadratic, so read d2E/dQ2 off the
     #                    derivative rather than off kappa.
     charge_conditioning: str = "film"
+    # For the quadratic modes: the d2E/dq2 the model should start at, in V/e,
+    # for a system of `kappa_target_atoms` atoms. A physical number rather than
+    # a magic bias -- the razor slabs sit near 9.2 V/e (C0 ~ 2.1 uF/cm^2), so
+    # that is the default. The per-atom softplus bias is derived from it in
+    # `_kappa_bias`, which divides by the atom count AND by the number of
+    # readout sites, so changing `lr` or `num_message_passing` does not
+    # silently move the starting curvature. Set to None to fall back to
+    # QuadraticReadout's own default.
+    kappa_target: float | None = 9.2
+    kappa_target_atoms: int = 108
     num_message_passing: int = 0
     equivariant_message_passing: bool = True
     initialize_node_features: bool = True
@@ -102,6 +113,8 @@ class Lorem(nn.Module):
         use_film = self.charge_conditioning == "film"
         quadratic = self.charge_conditioning in ("quadratic", "quadratic_film")
 
+        kappa_bias = self._kappa_bias()
+
         def readout(x):
             """One per-atom energy contribution from the scalar features.
 
@@ -109,7 +122,9 @@ class Lorem(nn.Module):
             exactly as the three inline MLPs did before.
             """
             if quadratic:
-                return QuadraticReadout(d)(Q_i, x, atom_mask)
+                return QuadraticReadout(d, kappa_bias_init=kappa_bias)(
+                    Q_i, x, atom_mask
+                )
             return masked(MLP(features=[d, d, 1]), x, atom_mask)[..., 0]
 
         # empirical factors to make var of equivariant norm more uniform across l
@@ -287,9 +302,41 @@ class Lorem(nn.Module):
             # Near zero at init, since ChargeConditioning is near-identity and
             # the readout weights start small.
             residual = ChargeConditioning(d)(Q_i, nodes_scalar, atom_mask)
-            energy += masked(MLP(features=[d, d, 1]), residual, atom_mask)[..., 0]
+            correction = masked(MLP(features=[d, d, 1]), residual, atom_mask)[..., 0]
+            # Zero-initialised gate, so the residual starts at exactly zero and
+            # this mode starts identical to "quadratic". Without it the head's
+            # final Dense carries its default init, contributing arbitrary
+            # curvature in q: measured on a 108-atom slab with lr=True it put
+            # d2E/dq2 at -7.95 V/e, a negative capacitance, against a target of
+            # 9.2. The gate opens only if the data asks for anharmonicity,
+            # which is what makes this a residual rather than a second model.
+            gate = self.param("film_residual_gate", nn.initializers.zeros, ())
+            energy += gate * correction
 
         return energy
+
+    def _kappa_bias(self):
+        """Per-atom softplus bias giving `kappa_target` on a nominal system.
+
+        kappa is summed over atoms and over readout sites, so the per-atom
+        value wanted is the target divided by both, and the bias is its
+        softplus inverse. Deriving it means `lr` and `num_message_passing` can
+        change without the starting curvature moving with them.
+
+        This lands somewhat above the target in practice -- softplus is convex,
+        so its mean over the readout head's own output spread exceeds
+        softplus(bias). Measured on a 108-atom slab with two sites, a target of
+        9.2 starts the model near 13 rather than 9.2. That is the right order,
+        which is all an initialisation owes; the bias is learnable and the
+        d2Edq2 loss term drives it directly.
+        """
+        if self.kappa_target is None:
+            return QuadraticReadout.kappa_bias_init
+
+        n_sites = 1 + self.num_message_passing + (1 if self.lr else 0)
+        per_atom = self.kappa_target / (self.kappa_target_atoms * n_sites)
+        # softplus^-1(y) = log(exp(y) - 1)
+        return float(np.log(np.expm1(per_atom)))
 
     def atoms_to_batch(self, atoms):
         from lorem.batching import to_batch, to_sample

@@ -258,13 +258,10 @@ class QuadraticReadout(nn.Module):
     """
 
     features: int
-    # Calibrated so a ~100-atom slab starts near the razor data's 9 V/e rather
-    # than at an arbitrary scale. Two things make the naive estimate too low:
-    # the readout runs once per site (initial, per message-passing step, and
-    # long-range), and softplus is convex so its mean over the head's output
-    # spread exceeds softplus(bias). Measured on the real 108-atom geometry
-    # with two readout sites: -2.5 gives 23 V/e, -3.5 gives ~9. It is a
-    # learnable parameter, so this only sets where training starts.
+    # Where kappa starts, as softplus(bias). Callers pass this in rather than
+    # hardcoding it: see `Lorem.kappa_target`, which turns a physical
+    # d2E/dq2 into a per-atom, per-readout-site value. It is a learnable
+    # parameter, so this only sets where training starts.
     kappa_bias_init: float = -3.5
 
     @nn.compact
