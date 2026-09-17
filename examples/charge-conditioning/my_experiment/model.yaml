@@ -7,5 +7,7 @@ model:
     num_message_passing: 1
     num_spherical_features: 4
     lr: false
-    charge_conditioning: "film"  # alternative: "latent" (conserving charge channel, backbone.py)
-    # film_every_layer: true  # reapply FiLM at every Update() call, not just the first
+    # "film" modulates the node features on Q; "quadratic" instead expands the
+    # energy as E0 + Phi0 Q + kappa Q^2/2 with learned per-structure
+    # coefficients; "quadratic_film" adds a FiLM residual on top of that.
+    charge_conditioning: "film"

@@ -204,7 +204,8 @@ def test_calculator_picks_up_total_charge_change_at_fixed_geometry():
 # asks for it.
 
 
-def _make_q_model(predict_bec=False, max_degree=TEST_MAX_DEGREE):
+def _make_q_model(predict_bec=False, max_degree=TEST_MAX_DEGREE,
+                  charge_conditioning="film"):
     return LoremQ(
         cutoff=4.0,
         max_degree=max_degree,
@@ -213,6 +214,7 @@ def _make_q_model(predict_bec=False, max_degree=TEST_MAX_DEGREE):
         num_radial=4,
         num_message_passing=1,
         predict_bec=predict_bec,
+        charge_conditioning=charge_conditioning,
     )
 
 
@@ -381,3 +383,101 @@ def test_plain_lorem_reports_no_charge_derivatives():
     assert "work_function" not in results
     assert "bec_z" not in results
 
+
+
+# -- d2E/dq2, and the quadratic charge head --
+
+MODES = ["film", "quadratic", "quadratic_film"]
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_d2Edq2_matches_finite_difference_of_energy(mode):
+    """The reported d2E/dq2 is the second derivative of the energy it reports.
+
+    Same float32 rationale as the work-function test: h ~ eps^(1/4) for a
+    second difference, whose roundoff floor is O(eps/h^2), and the tolerance is
+    set by the finite difference rather than by autodiff.
+    """
+    model = _make_q_model(predict_bec=True, charge_conditioning=mode)
+    params = model.init(jax.random.key(0), *model.dummy_inputs())
+
+    q0, h = 0.3, 2e-2
+    got = model.predict(params, _batch_at_charge(model, q0))["d2Edq2"][0]
+    e_p = model.predict(params, _batch_at_charge(model, q0 + h))["energy"][0]
+    e_0 = model.predict(params, _batch_at_charge(model, q0))["energy"][0]
+    e_m = model.predict(params, _batch_at_charge(model, q0 - h))["energy"][0]
+    expected = (e_p - 2.0 * e_0 + e_m) / h**2
+
+    np.testing.assert_allclose(float(got), float(expected), rtol=5e-2, atol=1e-3)
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_d2Edq2_absent_unless_requested(mode):
+    model = _make_q_model(predict_bec=False, charge_conditioning=mode)
+    params = model.init(jax.random.key(0), *model.dummy_inputs())
+    assert "d2Edq2" not in model.predict(params, _batch_at_charge(model, 0.3))
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_d2Edq2_is_zero_on_padded_structures(mode):
+    model = _make_q_model(predict_bec=True, charge_conditioning=mode)
+    params = model.init(jax.random.key(0), *model.dummy_inputs())
+    batch = _batch_at_charge(model, 0.3)
+    d2 = np.asarray(model.predict(params, batch)["d2Edq2"])
+    assert d2.shape == np.asarray(model.predict(params, batch)["energy"]).shape
+    pad = ~np.asarray(batch.sr.structure_mask).astype(bool)
+    if pad.any():
+        assert np.allclose(d2[pad], 0.0)
+
+
+def test_quadratic_mode_energy_is_exactly_quadratic_in_charge():
+    """The property the whole `quadratic` variant rests on, asserted not assumed.
+
+    A cubic-or-higher term would show up as a non-vanishing third difference.
+    The comparison is against the second difference at the same step, so the
+    test measures curvature actually present rather than an absolute epsilon.
+    """
+    model = _make_q_model(predict_bec=False, charge_conditioning="quadratic")
+    params = model.init(jax.random.key(0), *model.dummy_inputs())
+
+    h = 0.25
+    e = [float(model.predict(params, _batch_at_charge(model, q))["energy"][0])
+         for q in (-1.5 * h, -0.5 * h, 0.5 * h, 1.5 * h)]
+    third = e[3] - 3.0 * e[2] + 3.0 * e[1] - e[0]
+    second = e[3] - e[2] - e[1] + e[0]
+    assert abs(third) < 1e-3 * max(abs(second), 1e-6)
+
+
+def test_quadratic_film_is_not_exactly_quadratic():
+    """The residual head exists to break exact quadraticity -- if it did not,
+    the variant would be indistinguishable from `quadratic` and the comparison
+    would be measuring nothing."""
+    model = _make_q_model(predict_bec=False, charge_conditioning="quadratic_film")
+    key = jax.random.key(0)
+    params = model.init(key, *model.dummy_inputs())
+    # the residual is ~0 at init by construction, so perturb it awake
+    flat = jax.tree_util.tree_map(lambda x: x + 0.1 * jax.random.normal(key, x.shape), params)
+
+    h = 0.25
+    e = [float(model.predict(flat, _batch_at_charge(model, q))["energy"][0])
+         for q in (-1.5 * h, -0.5 * h, 0.5 * h, 1.5 * h)]
+    third = e[3] - 3.0 * e[2] + 3.0 * e[1] - e[0]
+    second = e[3] - e[2] - e[1] + e[0]
+    assert abs(third) > 1e-9 * max(abs(second), 1e-6)
+
+
+def test_quadratic_curvature_is_positive():
+    """kappa passes through a softplus, so d2E/dq2 cannot come out negative --
+    a capacitance has a sign."""
+    model = _make_q_model(predict_bec=True, charge_conditioning="quadratic")
+    params = model.init(jax.random.key(0), *model.dummy_inputs())
+    for q in (-1.0, 0.0, 1.0):
+        d2 = model.predict(params, _batch_at_charge(model, q))["d2Edq2"]
+        mask = np.asarray(model.predict(params, _batch_at_charge(model, q))["energy"]) != 0
+        assert (np.asarray(d2)[mask] > 0).all()
+
+
+def test_unknown_charge_conditioning_is_rejected():
+    model = _make_q_model(charge_conditioning="latent")
+    with pytest.raises(ValueError, match="unknown charge_conditioning"):
+        model.init(jax.random.key(0), *model.dummy_inputs())

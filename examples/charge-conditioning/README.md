@@ -2,10 +2,11 @@
 
 Trains `Lorem` on a small mixed-charge-state dataset, to check that
 conditioning the model on the total charge `Q` of a structure actually helps
-it tell charge states apart. `Lorem`/`LoremBEC` always condition on `Q` via
-FiLM (see `backbone.py`'s `ChargeConditioning`) — there's no config knob to turn this
-off, since a missing/zero `Q` is harmless (the FiLM layer is a near-identity
-transform at `Q=0`).
+it tell charge states apart. `Lorem`/`LoremQ` condition on `Q` through `charge_conditioning`, which selects
+between FiLM modulation of the node features (`backbone.py`'s
+`ChargeConditioning`) and an explicit quadratic expansion of the energy in `Q`
+(`QuadraticReadout`). A missing/zero `Q` is harmless either way — the FiLM layer
+is a near-identity transform at `Q=0`, and the quadratic terms vanish.
 
 ## Data
 
@@ -23,10 +24,8 @@ channel.
 
 The original `tot_charge` field in `atoms.info` has been renamed to
 `total_charge`, which is the key `lorem/batching.py` reads to populate the
-model's `Q` input. `Lorem`/`LoremBEC` default to `charge_conditioning="film"`
-and treat a missing `total_charge` as Q=0, so this is also the ordinary
-(unconditioned) training path if you ever want to compare against
-`charge_conditioning="none"`.
+model's `Q` input. `Lorem`/`LoremQ` default to `charge_conditioning="film"`
+and treat a missing `total_charge` as Q=0.
 
 ## Files
 

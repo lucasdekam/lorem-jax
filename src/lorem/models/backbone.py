@@ -236,3 +236,45 @@ class ChargeConditioning(nn.Module):
         )
         gamma, beta = jnp.split(gamma_beta, 2, axis=-1)
         return (1.0 + gamma) * x + beta  # near-identity at init
+
+
+class QuadraticReadout(nn.Module):
+    """Per-atom energy as an explicit quadratic in the total charge.
+
+        E_i = E0_i(R) + Phi0_i(R) Q + 1/2 kappa_i(R) Q^2
+
+    The alternative, `ChargeConditioning`, lets Q modulate the features and so
+    leaves E(Q) an arbitrary learned function. Here the Q dependence is the
+    capacitor expansion the capacitance formalism assumes, with all three
+    coefficients learned per structure -- so `d2E/dQ2` is `sum_i kappa_i`, a
+    quantity the model states rather than one a second derivative has to
+    uncover, and no constant-capacitance assumption is imposed.
+
+    `kappa` passes through a softplus, so every atom's curvature contribution
+    is positive and the structure sum cannot come out negative: a capacitance
+    has a sign. `kappa_bias` shifts the softplus so the structure total starts
+    near the data rather than at `n_atoms * softplus(0) = 0.69 n_atoms`, which
+    for a 108-atom slab would be ~75 V/e against a true value near 9.
+    """
+
+    features: int
+    # Calibrated so a ~100-atom slab starts near the razor data's 9 V/e rather
+    # than at an arbitrary scale. Two things make the naive estimate too low:
+    # the readout runs once per site (initial, per message-passing step, and
+    # long-range), and softplus is convex so its mean over the head's output
+    # spread exceeds softplus(bias). Measured on the real 108-atom geometry
+    # with two readout sites: -2.5 gives 23 V/e, -3.5 gives ~9. It is a
+    # learnable parameter, so this only sets where training starts.
+    kappa_bias_init: float = -3.5
+
+    @nn.compact
+    def __call__(self, Q_i, x, atom_mask):
+        out = _masked(
+            MLP(features=[self.features, self.features, 3]), x, atom_mask
+        )
+        e0, phi0, kappa = out[..., 0], out[..., 1], out[..., 2]
+        bias = self.param(
+            "kappa_bias", nn.initializers.constant(self.kappa_bias_init), ()
+        )
+        kappa = jax.nn.softplus(kappa + bias)
+        return e0 + phi0 * Q_i + 0.5 * kappa * Q_i**2

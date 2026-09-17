@@ -8,6 +8,7 @@ from jaxpme.batched_mixed import Ewald
 from lorem.models.backbone import (
     MLP,
     ChargeConditioning,
+    QuadraticReadout,
     Initial,
     RadialCoefficients,
     Update,
@@ -34,6 +35,18 @@ class Lorem(nn.Module):
     cutoff_fn: str = "cosine_cutoff"
     radial_basis: str = "basic_bernstein"
     lr: bool = True
+    # how the total charge enters the energy:
+    #   "film"           FiLM-modulate the node features once, early. E(Q) is
+    #                    then an arbitrary learned function.
+    #   "quadratic"      no FiLM; each readout emits (E0, Phi0, kappa) from
+    #                    charge-free features and E(Q) is exactly quadratic, so
+    #                    d2E/dQ2 is a stated quantity and positive by
+    #                    construction. See backbone.QuadraticReadout.
+    #   "quadratic_film" the quadratic form plus one FiLM-conditioned residual
+    #                    head, for anharmonicity beyond second order. E(Q) is
+    #                    no longer exactly quadratic, so read d2E/dQ2 off the
+    #                    derivative rather than off kappa.
+    charge_conditioning: str = "film"
     num_message_passing: int = 0
     equivariant_message_passing: bool = True
     initialize_node_features: bool = True
@@ -81,6 +94,24 @@ class Lorem(nn.Module):
 
         Q_i = Q[atom_to_structure] * atom_mask
 
+        if self.charge_conditioning not in ("film", "quadratic", "quadratic_film"):
+            raise ValueError(
+                f"unknown charge_conditioning {self.charge_conditioning!r}; "
+                f"expected 'film', 'quadratic' or 'quadratic_film'"
+            )
+        use_film = self.charge_conditioning == "film"
+        quadratic = self.charge_conditioning in ("quadratic", "quadratic_film")
+
+        def readout(x):
+            """One per-atom energy contribution from the scalar features.
+
+            Called once per readout site, so each call makes its own parameters
+            exactly as the three inline MLPs did before.
+            """
+            if quadratic:
+                return QuadraticReadout(d)(Q_i, x, atom_mask)
+            return masked(MLP(features=[d, d, 1]), x, atom_mask)[..., 0]
+
         # empirical factors to make var of equivariant norm more uniform across l
         l_factors = (
             jnp.array([(2 * l + 1) for l in range(max_degree + 1)], dtype=float) ** 0.25
@@ -127,7 +158,8 @@ class Lorem(nn.Module):
         )
 
         nodes_scalar = Update(d)(nodes_scalar, updates, atom_mask)
-        nodes_scalar = ChargeConditioning(d)(Q_i, nodes_scalar, atom_mask)
+        if use_film:
+            nodes_scalar = ChargeConditioning(d)(Q_i, nodes_scalar, atom_mask)
 
         coefficients = masked(
             nn.Dense(num_l * s, use_bias=False), edges_scalar, pair_mask
@@ -154,7 +186,7 @@ class Lorem(nn.Module):
         nodes_scalar = Update(d)(nodes_scalar, updates, atom_mask)
 
         # -- initial prediction --
-        energy = masked(MLP(features=[d, d, 1]), nodes_scalar, atom_mask)[..., 0]
+        energy = readout(nodes_scalar)
 
         # -- message passing (if turned on) --
         for _ in range(self.num_message_passing):
@@ -209,7 +241,7 @@ class Lorem(nn.Module):
                 nodes_scalar = Update(d)(nodes_scalar, updates, atom_mask)
 
             # -- residual prediction --
-            energy += masked(MLP(features=[d, d, 1]), nodes_scalar, atom_mask)[..., 0]
+            energy += readout(nodes_scalar)
 
         if self.lr:
             # -- compute LR potentials --
@@ -245,7 +277,17 @@ class Lorem(nn.Module):
             nodes_scalar = Update(d)(nodes_scalar, updates, atom_mask)
 
             # -- residual prediction --
-            energy += masked(MLP(features=[d, d, 1]), nodes_scalar, atom_mask)[..., 0]
+            energy += readout(nodes_scalar)
+
+        if self.charge_conditioning == "quadratic_film":
+            # anharmonic correction on top of the quadratic form. The features
+            # feeding the quadratic heads stay charge-free deliberately: FiLMing
+            # them would make E0/Phi0/kappa themselves Q-dependent, E(Q) would
+            # stop being quadratic, and kappa would quietly stop being d2E/dQ2.
+            # Near zero at init, since ChargeConditioning is near-identity and
+            # the readout weights start small.
+            residual = ChargeConditioning(d)(Q_i, nodes_scalar, atom_mask)
+            energy += masked(MLP(features=[d, d, 1]), residual, atom_mask)[..., 0]
 
         return energy
 
@@ -346,13 +388,20 @@ class LoremQ(Lorem):
       the forces.
     - `bec_z` = -(A eps0) d2E/(dr dq), the Born effective charge. Costs a
       forward-over-reverse pass, so it stays behind `predict_bec`.
+    - `d2Edq2` = d2E/dq2, the inverse frozen-nuclei capacitance up to 1/A. It
+      rides along on the `bec_z` pass for free, so it shares that flag.
+
+    Both second derivatives are taken by autograd rather than read off the
+    quadratic head's `kappa`, so every `charge_conditioning` mode reports the
+    same quantity by the same route -- and it stays correct for
+    `quadratic_film`, where `kappa` is no longer the whole curvature.
     """
 
     # off by default: unlike the work function this is not free, so only runs
     # that actually supervise it should pay for it
     predict_bec: bool = False
 
-    def _bec_z(self, params, batch):
+    def _charge_second_derivatives(self, params, batch):
         """Born effective charges, as the mixed second derivative.
 
         The charge sets a surface charge density q/A, hence a field q/(A eps0)
@@ -372,18 +421,23 @@ class LoremQ(Lorem):
         """
         sr = batch[1]
 
-        def dE_dpositions(total_charge):
-            def energy_of_positions(positions):
+        def first_derivatives(total_charge):
+            def energy_of(positions, charge):
                 shifted = batch._replace(
                     sr=sr._replace(positions=positions),
-                    total_charge=total_charge,
+                    total_charge=charge,
                 )
                 return self.energy(params, shifted)[0]
 
-            return jax.grad(energy_of_positions)(sr.positions)
+            # one reverse pass for both gradients: jax handles a tuple of
+            # argnums in a single backward sweep
+            return jax.grad(energy_of, argnums=(0, 1))(sr.positions, total_charge)
 
-        _, d2E_drdq = jax.jvp(
-            dE_dpositions,
+        # forward-over-reverse. Linearising BOTH first derivatives in the charge
+        # costs one extra tangent component in an already-linearised
+        # computation, so d2E/dq2 is free once bec_z is being computed.
+        _, (d2E_drdq, d2E_dq2) = jax.jvp(
+            first_derivatives,
             (batch.total_charge,),
             (jnp.ones_like(batch.total_charge),),
         )
@@ -395,7 +449,8 @@ class LoremQ(Lorem):
         )
         scale = (area * EPSILON_0)[sr.atom_to_structure][:, None]
 
-        return -d2E_drdq * scale * sr.atom_mask[:, None]
+        bec_z = -d2E_drdq * scale * sr.atom_mask[:, None]
+        return bec_z, d2E_dq2 * sr.structure_mask
 
     def predict(self, params, batch, stress=False):
         sr = batch[1]
@@ -413,7 +468,10 @@ class LoremQ(Lorem):
         }
 
         if self.predict_bec:
-            results["bec_z"] = self._bec_z(params, batch)
+            # both come out of the same forward-over-reverse pass
+            bec_z, d2Edq2 = self._charge_second_derivatives(params, batch)
+            results["bec_z"] = bec_z
+            results["d2Edq2"] = d2Edq2
 
         if stress:
             results["stress"] = self._stress(sr, batch_grads.sr)
