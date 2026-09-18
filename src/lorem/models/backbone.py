@@ -239,41 +239,59 @@ class ChargeConditioning(nn.Module):
 
 
 class QuadraticReadout(nn.Module):
-    """Per-atom energy as an explicit quadratic in the total charge.
+    """The coefficients of a per-atom expansion of the energy in the charge.
 
         E_i = E0_i(R) + Phi0_i(R) Q + 1/2 kappa_i(R) Q^2
 
-    The alternative, `ChargeConditioning`, lets Q modulate the features and so
-    leaves E(Q) an arbitrary learned function. Here the Q dependence is the
-    capacitor expansion the capacitance formalism assumes, with all three
-    coefficients learned per structure -- so `d2E/dQ2` is `sum_i kappa_i`, a
-    quantity the model states rather than one a second derivative has to
-    uncover, and no constant-capacitance assumption is imposed.
+    This module emits the three coefficient fields from charge-free features;
+    the caller assembles them, because the curvature is closed at the structure
+    level rather than here. `ChargeConditioning`, the alternative, lets Q
+    modulate the features instead and leaves E(Q) an arbitrary learned
+    function. Here the Q dependence is the capacitor expansion the capacitance
+    formalism assumes, with every coefficient learned per structure and no
+    constant-capacitance assumption imposed.
 
-    `kappa` passes through a softplus, so every atom's curvature contribution
-    is positive and the structure sum cannot come out negative: a capacitance
-    has a sign. `kappa_bias` shifts the softplus so the structure total starts
-    near the data rather than at `n_atoms * softplus(0) = 0.69 n_atoms`, which
-    for a 108-atom slab would be ~75 V/e against a true value near 9.
+    `kappa` comes out of its own MLP rather than as a third channel of the one
+    producing E0. E0 carries eV-scale values and the bulk of the loss, and a
+    shared trunk hands kappa whatever representation the energy happened to
+    want.
+
+    `kappa` is returned as a *pre-activation*. Positivity is a property of the
+    structure sum -- a capacitance has a sign -- not of each atom's share of
+    it, and the atom-decomposed inverse capacitance is free to be negative
+    somewhere. Constraining every atom instead forces each contribution down to
+    target/(n_atoms n_sites), a few hundredths, where softplus' is ~0.04 and
+    every gradient reaching the head is scaled by that factor.
     """
 
     features: int
-    # Where kappa starts, as softplus(bias). Zero is the neutral default: it
-    # encodes no assumption about system size or dataset, and callers who care
-    # pass a value in. `Lorem.kappa_target` is the one that does, turning a
-    # physical d2E/dq2 into a per-atom, per-readout-site bias. A dataset-tuned
-    # constant here would silently follow the module into systems it was never
-    # calibrated for. Learnable either way, so this only sets a starting point.
-    kappa_bias_init: float = 0.0
+    # off for the constant-curvature variant, where a single global parameter
+    # sets kappa and a per-atom head would be unused weight
+    geometry_dependent_kappa: bool = True
 
     @nn.compact
-    def __call__(self, Q_i, x, atom_mask):
-        out = _masked(
-            MLP(features=[self.features, self.features, 3]), x, atom_mask
-        )
-        e0, phi0, kappa = out[..., 0], out[..., 1], out[..., 2]
-        bias = self.param(
-            "kappa_bias", nn.initializers.constant(self.kappa_bias_init), ()
-        )
-        kappa = jax.nn.softplus(kappa + bias)
-        return e0 + phi0 * Q_i + 0.5 * kappa * Q_i**2
+    def __call__(self, x, atom_mask):
+        out = _masked(MLP(features=[self.features, self.features, 2]), x, atom_mask)
+        e0, phi0 = out[..., 0], out[..., 1]
+
+        if not self.geometry_dependent_kappa:
+            return e0, phi0, jnp.zeros_like(e0)
+
+        # zero-initialised output layer, so every atom's contribution starts at
+        # exactly 0 and the structure curvature starts at softplus(kappa_init)
+        # whatever the system size. A default-initialised layer would instead
+        # sum n_atoms x n_sites random numbers into the softplus, putting the
+        # starting curvature somewhere that drifts with the cell. The weights
+        # still get gradient from step one -- the layer's input is not zero --
+        # exactly as for the FiLM residual's gate.
+        hidden = _masked(MLP(features=[self.features, self.features]), x, atom_mask)
+        kappa = _masked(
+            nn.Dense(
+                1,
+                kernel_init=nn.initializers.zeros,
+                bias_init=nn.initializers.zeros,
+            ),
+            jax.nn.silu(hidden),
+            atom_mask,
+        )[..., 0]
+        return e0, phi0, kappa

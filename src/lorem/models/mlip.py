@@ -1,6 +1,5 @@
 import jax
 import jax.numpy as jnp
-import numpy as np
 
 import e3x
 import flax.linen as nn
@@ -37,27 +36,26 @@ class Lorem(nn.Module):
     radial_basis: str = "basic_bernstein"
     lr: bool = True
     # how the total charge enters the energy:
-    #   "film"           FiLM-modulate the node features once, early. E(Q) is
-    #                    then an arbitrary learned function.
-    #   "quadratic"      no FiLM; each readout emits (E0, Phi0, kappa) from
-    #                    charge-free features and E(Q) is exactly quadratic, so
-    #                    d2E/dQ2 is a stated quantity and positive by
-    #                    construction. See backbone.QuadraticReadout.
-    #   "quadratic_film" the quadratic form plus one FiLM-conditioned residual
-    #                    head, for anharmonicity beyond second order. E(Q) is
-    #                    no longer exactly quadratic, so read d2E/dQ2 off the
-    #                    derivative rather than off kappa.
+    #   "film"            FiLM-modulate the node features once, early. E(Q) is
+    #                     then an arbitrary learned function.
+    #   "quadratic"       no FiLM; the readouts emit (E0, Phi0, kappa) from
+    #                     charge-free features and E(Q) is exactly quadratic,
+    #                     so d2E/dQ2 is a stated quantity, positive by
+    #                     construction, and available without autodiff.
+    #   "quadratic_const" the same, with kappa a single learned scalar for the
+    #                     whole model instead of a function of the geometry --
+    #                     the constant-capacitance assumption, as a control.
+    #   "quadratic_film"  the quadratic form plus one FiLM-conditioned residual
+    #                     head, for anharmonicity beyond second order. E(Q) is
+    #                     no longer exactly quadratic, so d2E/dQ2 has to come
+    #                     off the derivative rather than off kappa.
     charge_conditioning: str = "film"
-    # For the quadratic modes: the d2E/dq2 the model should start at, in V/e,
-    # for a system of `kappa_target_atoms` atoms. A physical number rather than
-    # a magic bias -- the razor slabs sit near 9.2 V/e (C0 ~ 2.1 uF/cm^2), so
-    # that is the default. The per-atom softplus bias is derived from it in
-    # `_kappa_bias`, which divides by the atom count AND by the number of
-    # readout sites, so changing `lr` or `num_message_passing` does not
-    # silently move the starting curvature. Set to None to fall back to
-    # QuadraticReadout's own default.
-    kappa_target: float | None = 9.2
-    kappa_target_atoms: int = 108
+    # Pre-activation offset on the *structure* curvature, so d2E/dQ2 starts at
+    # softplus(kappa_init). Zero is the neutral default and encodes nothing
+    # about system size or dataset; an experiment that wants to start on its
+    # data passes the number in from its config, where it can be read back
+    # against the dataset it came from.
+    kappa_init: float = 0.0
     num_message_passing: int = 0
     equivariant_message_passing: bool = True
     initialize_node_features: bool = True
@@ -70,15 +68,28 @@ class Lorem(nn.Module):
     def to_sample(self):
         return ToSample
 
+    def __call__(self, Z_i, sr, nopbc, pbc, Q):
+        """Per-atom energies -- the contract every caller but `LoremQ` uses."""
+        return self.coefficients(Z_i, sr, nopbc, pbc, Q)[0]
+
     @nn.compact
-    def __call__(
-        self,
-        Z_i,
-        sr,
-        nopbc,
-        pbc,
-        Q,
-    ):
+    def coefficients(self, Z_i, sr, nopbc, pbc, Q):
+        """Per-atom energies, plus the charge expansion's structure-level terms.
+
+        Returns `(energy_i, B_s, K_s)`. In the exactly-quadratic modes
+
+            E_s(q) = A_s + B_s q + 1/2 K_s q^2
+
+        holds identically, so `B_s + K_s q` *is* dE/dq and `K_s` *is* d2E/dq2 --
+        both without autodiff, and `bec_z` becomes one reverse pass over
+        `B_s + K_s q` instead of a forward-over-reverse pass over the energy.
+        `LoremQ.predict` takes that route when it is available.
+
+        `B_s` and `K_s` are None for `film` and `quadratic_film`, where E(q) is
+        not quadratic and only the derivative is the honest answer. Returning
+        None rather than a partial coefficient is deliberate: a caller cannot
+        then quietly use the quadratic part as though it were the whole.
+        """
         R = sr.positions
         i = sr.centers
         j = sr.others
@@ -105,27 +116,44 @@ class Lorem(nn.Module):
 
         Q_i = Q[atom_to_structure] * atom_mask
 
-        if self.charge_conditioning not in ("film", "quadratic", "quadratic_film"):
+        modes = ("film", "quadratic", "quadratic_const", "quadratic_film")
+        if self.charge_conditioning not in modes:
             raise ValueError(
                 f"unknown charge_conditioning {self.charge_conditioning!r}; "
-                f"expected 'film', 'quadratic' or 'quadratic_film'"
+                f"expected one of {modes}"
             )
         use_film = self.charge_conditioning == "film"
-        quadratic = self.charge_conditioning in ("quadratic", "quadratic_film")
-
-        kappa_bias = self._kappa_bias()
+        quadratic = self.charge_conditioning != "film"
+        # the constant variant learns one global kappa, so the per-atom head
+        # would only be dead weight
+        per_atom_kappa = self.charge_conditioning != "quadratic_const"
 
         def readout(x):
-            """One per-atom energy contribution from the scalar features.
+            """One readout site's contribution to (E0_i, Phi0_i, kappa_i).
 
-            Called once per readout site, so each call makes its own parameters
-            exactly as the three inline MLPs did before.
+            Called once per site, so each call makes its own parameters exactly
+            as the three inline MLPs did before. For `film` there is no charge
+            expansion and the site produces an energy directly.
             """
             if quadratic:
-                return QuadraticReadout(d, kappa_bias_init=kappa_bias)(
-                    Q_i, x, atom_mask
+                return QuadraticReadout(d, geometry_dependent_kappa=per_atom_kappa)(
+                    x, atom_mask
                 )
-            return masked(MLP(features=[d, d, 1]), x, atom_mask)[..., 0]
+            e = masked(MLP(features=[d, d, 1]), x, atom_mask)[..., 0]
+            zero = jnp.zeros_like(e)
+            return e, zero, zero
+
+        # per-atom accumulators, summed over readout sites
+        e0_i = jnp.zeros((num_atoms,), dtype=R.dtype)
+        phi0_i = jnp.zeros((num_atoms,), dtype=R.dtype)
+        kappa_i = jnp.zeros((num_atoms,), dtype=R.dtype)
+
+        def accumulate(x):
+            nonlocal e0_i, phi0_i, kappa_i
+            e, phi, kap = readout(x)
+            e0_i = e0_i + e
+            phi0_i = phi0_i + phi
+            kappa_i = kappa_i + kap
 
         # empirical factors to make var of equivariant norm more uniform across l
         l_factors = (
@@ -201,7 +229,7 @@ class Lorem(nn.Module):
         nodes_scalar = Update(d)(nodes_scalar, updates, atom_mask)
 
         # -- initial prediction --
-        energy = readout(nodes_scalar)
+        accumulate(nodes_scalar)
 
         # -- message passing (if turned on) --
         for _ in range(self.num_message_passing):
@@ -256,7 +284,7 @@ class Lorem(nn.Module):
                 nodes_scalar = Update(d)(nodes_scalar, updates, atom_mask)
 
             # -- residual prediction --
-            energy += readout(nodes_scalar)
+            accumulate(nodes_scalar)
 
         if self.lr:
             # -- compute LR potentials --
@@ -292,51 +320,73 @@ class Lorem(nn.Module):
             nodes_scalar = Update(d)(nodes_scalar, updates, atom_mask)
 
             # -- residual prediction --
-            energy += readout(nodes_scalar)
+            accumulate(nodes_scalar)
+
+        # -- close the charge expansion --
+        num_structures = Q.shape[0]
+        mask = atom_mask.astype(R.dtype)
+
+        energy = e0_i + phi0_i * Q_i
+
+        if quadratic:
+            if per_atom_kappa:
+                # The softplus closes on the *structure* sum, not per atom.
+                # Positivity is a property of the capacitance, and imposing it
+                # atom by atom pins every contribution at target/(n_atoms
+                # n_sites) -- a few hundredths, where softplus' is ~0.04 and
+                # the head's gradients are damped by that factor. Here the
+                # operating point is the physical value, where softplus' ~ 1.
+                raw = jax.ops.segment_sum(
+                    kappa_i * mask, atom_to_structure, num_segments=num_structures
+                )
+            else:
+                raw = self.param("kappa_const", nn.initializers.zeros, ()) * jnp.ones(
+                    (num_structures,), dtype=R.dtype
+                )
+
+            K_s = jax.nn.softplus(raw + self.kappa_init)
+
+            # spread the structure term back over its own atoms so the return
+            # value stays per-atom. The split is arbitrary and exact in the
+            # sum, which is all that reaches energy, forces and dE/dq. The
+            # clamp keeps padded structures, which own no atoms, out of 0/0.
+            counts = jnp.maximum(
+                jax.ops.segment_sum(
+                    mask, atom_to_structure, num_segments=num_structures
+                ),
+                1.0,
+            )
+            energy = energy + 0.5 * (K_s / counts)[atom_to_structure] * Q_i**2
+
+            B_s = jax.ops.segment_sum(
+                phi0_i * mask, atom_to_structure, num_segments=num_structures
+            )
+        else:
+            B_s = K_s = None
+
+        energy = energy * mask
 
         if self.charge_conditioning == "quadratic_film":
             # anharmonic correction on top of the quadratic form. The features
             # feeding the quadratic heads stay charge-free deliberately: FiLMing
             # them would make E0/Phi0/kappa themselves Q-dependent, E(Q) would
             # stop being quadratic, and kappa would quietly stop being d2E/dQ2.
-            # Near zero at init, since ChargeConditioning is near-identity and
-            # the readout weights start small.
             residual = ChargeConditioning(d)(Q_i, nodes_scalar, atom_mask)
             correction = masked(MLP(features=[d, d, 1]), residual, atom_mask)[..., 0]
             # Zero-initialised gate, so the residual starts at exactly zero and
             # this mode starts identical to "quadratic". Without it the head's
             # final Dense carries its default init, contributing arbitrary
             # curvature in q: measured on a 108-atom slab with lr=True it put
-            # d2E/dq2 at -7.95 V/e, a negative capacitance, against a target of
-            # 9.2. The gate opens only if the data asks for anharmonicity,
-            # which is what makes this a residual rather than a second model.
+            # d2E/dq2 at -7.95 V/e, a negative capacitance. The gate opens only
+            # if the data asks for anharmonicity, which is what makes this a
+            # residual rather than a second model.
             gate = self.param("film_residual_gate", nn.initializers.zeros, ())
-            energy += gate * correction
+            energy = energy + gate * correction
+            # E(q) is no longer quadratic, so the coefficients no longer
+            # describe it and must not be handed out as though they did
+            B_s = K_s = None
 
-        return energy
-
-    def _kappa_bias(self):
-        """Per-atom softplus bias giving `kappa_target` on a nominal system.
-
-        kappa is summed over atoms and over readout sites, so the per-atom
-        value wanted is the target divided by both, and the bias is its
-        softplus inverse. Deriving it means `lr` and `num_message_passing` can
-        change without the starting curvature moving with them.
-
-        This lands somewhat above the target in practice -- softplus is convex,
-        so its mean over the readout head's own output spread exceeds
-        softplus(bias). Measured on a 108-atom slab with two sites, a target of
-        9.2 starts the model near 13 rather than 9.2. That is the right order,
-        which is all an initialisation owes; the bias is learnable and the
-        d2Edq2 loss term drives it directly.
-        """
-        if self.kappa_target is None:
-            return QuadraticReadout.kappa_bias_init
-
-        n_sites = 1 + self.num_message_passing + (1 if self.lr else 0)
-        per_atom = self.kappa_target / (self.kappa_target_atoms * n_sites)
-        # softplus^-1(y) = log(exp(y) - 1)
-        return float(np.log(np.expm1(per_atom)))
+        return energy, B_s, K_s
 
     def atoms_to_batch(self, atoms):
         from lorem.batching import to_batch, to_sample
@@ -438,10 +488,23 @@ class LoremQ(Lorem):
     - `d2Edq2` = d2E/dq2, the inverse frozen-nuclei capacitance up to 1/A. It
       rides along on the `bec_z` pass for free, so it shares that flag.
 
-    Both second derivatives are taken by autograd rather than read off the
-    quadratic head's `kappa`, so every `charge_conditioning` mode reports the
-    same quantity by the same route -- and it stays correct for
-    `quadratic_film`, where `kappa` is no longer the whole curvature.
+    In the exactly-quadratic modes E(q) = A + B q + 1/2 K q^2 identically, so
+    `predict` takes the analytic route instead: dE/dq is B + K q and d2E/dq2 is
+    K, both without autodiff, and `bec_z` is a reverse sweep over B + K q
+    rather than a forward-over-reverse pass over the energy.
+
+    This is about the order of the derivative, not about speed. Measured on a
+    36-atom Pt slab the two routes cost the same (8.4 vs 8.3 ms), because the
+    backbone in these modes is charge-free: the q-tangent through it is
+    identically zero and XLA prunes the forward pass down to the readout
+    anyway. What the analytic route buys is that Z* comes out as a *first*
+    derivative, as razor and the SEBEC formalism take it, rather than as a
+    mixed second derivative in float32 -- and that dE/dq and d2E/dq2 are exact
+    and free even with `predict_bec` off. `tests/test_conditioning.py` pins the
+    two routes against each other; they agree because the identity is exact.
+
+    For `film` and `quadratic_film` E(q) is not quadratic and the derivative is
+    the only honest answer, so those keep the autodiff route.
     """
 
     # off by default: unlike the work function this is not free, so only runs
@@ -489,17 +552,86 @@ class LoremQ(Lorem):
             (jnp.ones_like(batch.total_charge),),
         )
 
-        # in-plane cell area; the out-of-plane vector varies per structure and
-        # must not enter (pbc = T T F)
-        area = jnp.linalg.norm(
-            jnp.cross(sr.cell[:, 0, :], sr.cell[:, 1, :]), axis=-1
-        )
-        scale = (area * EPSILON_0)[sr.atom_to_structure][:, None]
-
-        bec_z = -d2E_drdq * scale * sr.atom_mask[:, None]
+        bec_z = -d2E_drdq * self._bec_scale(sr) * sr.atom_mask[:, None]
         return bec_z, d2E_dq2 * sr.structure_mask
 
+    @staticmethod
+    def _bec_scale(sr):
+        """A eps0, per atom -- what turns d2E/(dr dq) into a dimensionless Z*.
+
+        The in-plane cell area only: the out-of-plane vector varies per
+        structure and must not enter (pbc = T T F).
+        """
+        area = jnp.linalg.norm(jnp.cross(sr.cell[:, 0, :], sr.cell[:, 1, :]), axis=-1)
+        return (area * EPSILON_0)[sr.atom_to_structure][:, None]
+
+    @property
+    def _exactly_quadratic(self):
+        """Whether E(q) is a quadratic the model states rather than one autodiff
+        has to uncover."""
+        return self.charge_conditioning in ("quadratic", "quadratic_const")
+
+    def _predict_quadratic(self, params, batch, stress=False):
+        """The analytic route, for the modes where E(q) is exactly quadratic.
+
+        One `jax.vjp` linearises the coefficient fields once; the forces and
+        the BECs are then two backward sweeps over that same linearisation,
+        seeded on the energy and on dE/dq respectively. dE/dq and d2E/dq2 are
+        read straight off B and K.
+        """
+        sr = batch[1]
+
+        def outputs(positions, cell):
+            shifted = batch._replace(
+                sr=sr._replace(positions=positions, cell=cell),
+            )
+            energies, B_s, K_s = self.apply(
+                params,
+                shifted.atomic_numbers,
+                shifted.sr,
+                shifted.nopbc,
+                shifted.pbc,
+                shifted.total_charge,
+                method=Lorem.coefficients,
+            )
+            phi = (B_s + K_s * shifted.total_charge) * sr.structure_mask
+            return (jnp.sum(energies), jnp.sum(phi)), (energies, phi, K_s)
+
+        (_, _), vjp_fn, (energies, phi, K_s) = jax.vjp(
+            outputs, sr.positions, sr.cell, has_aux=True
+        )
+
+        # seed on the energy: the forces, and the cell derivative for stress
+        dE_dr, dE_dcell = vjp_fn((1.0, 0.0))
+
+        energy = (
+            jax.ops.segment_sum(energies, sr.atom_to_structure, sr.cell.shape[0])
+            * sr.structure_mask
+        )
+        results = {
+            "energy": energy,
+            "forces": -dE_dr,
+            "work_function": phi,
+        }
+
+        if self.predict_bec:
+            # seed on dE/dq instead: d/dr of the work function is the mixed
+            # second derivative, no second-order autodiff involved
+            dphi_dr, _ = vjp_fn((0.0, 1.0))
+            results["bec_z"] = -dphi_dr * self._bec_scale(sr) * sr.atom_mask[:, None]
+            results["d2Edq2"] = K_s * sr.structure_mask
+
+        if stress:
+            results["stress"] = self._stress(
+                sr, sr._replace(positions=dE_dr, cell=dE_dcell)
+            )
+
+        return results
+
     def predict(self, params, batch, stress=False):
+        if self._exactly_quadratic:
+            return self._predict_quadratic(params, batch, stress=stress)
+
         sr = batch[1]
         energy, forces, batch_grads = self._energy_and_grads(params, batch)
 

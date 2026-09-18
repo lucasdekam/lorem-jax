@@ -387,7 +387,7 @@ def test_plain_lorem_reports_no_charge_derivatives():
 
 # -- d2E/dq2, and the quadratic charge head --
 
-MODES = ["film", "quadratic", "quadratic_film"]
+MODES = ["film", "quadratic", "quadratic_const", "quadratic_film"]
 
 
 @pytest.mark.parametrize("mode", MODES)
@@ -481,3 +481,126 @@ def test_unknown_charge_conditioning_is_rejected():
     model = _make_q_model(charge_conditioning="latent")
     with pytest.raises(ValueError, match="unknown charge_conditioning"):
         model.init(jax.random.key(0), *model.dummy_inputs())
+
+
+# -- the analytic route, for the modes where E(q) is exactly quadratic --
+#
+# `quadratic` and `quadratic_const` state E(q) = A + B q + 1/2 K q^2, so
+# `predict` reads dE/dq and d2E/dq2 off B and K and takes bec_z as a second
+# backward sweep instead of a forward-over-reverse pass. That is only sound if
+# it returns exactly what differentiating the energy returns, which is what
+# these pin down -- against `_charge_second_derivatives`, the autodiff route
+# the other modes still use.
+
+EXACT_MODES = ["quadratic", "quadratic_const"]
+
+
+def _slab_batch_at_charge(model, q, size=(1, 1, 2)):
+    """A 2D-periodic slab, so the in-plane area -- and hence bec_z -- is not
+    zero. An isolated molecule has no cell, `_bec_scale` is 0 there, and a
+    comparison of Born charges would hold trivially."""
+    from ase.build import fcc111
+
+    atoms = fcc111("Al", size=size, vacuum=6.0)
+    atoms.info["total_charge"] = q
+    return model.atoms_to_batch(atoms)
+
+
+@pytest.mark.parametrize("mode", EXACT_MODES)
+def test_analytic_charge_derivatives_match_autodiff(mode):
+    """The regression guard on the fast path: same numbers, cheaper route."""
+    model = _make_q_model(predict_bec=True, charge_conditioning=mode)
+    params = model.init(jax.random.key(0), *model.dummy_inputs())
+    batch = _slab_batch_at_charge(model, 0.4)
+
+    got = model.predict(params, batch)
+    bec, d2 = model._charge_second_derivatives(params, batch)
+    _, _, grads = model._energy_and_grads(params, batch)
+    wf = grads.total_charge * batch.sr.structure_mask
+
+    mask = np.asarray(batch.sr.structure_mask)
+    atoms = np.asarray(batch.sr.atom_mask)
+    assert np.abs(np.asarray(bec)[atoms]).max() > 0.0, "vacuous: bec_z is all zero"
+
+    np.testing.assert_allclose(
+        np.asarray(got["work_function"])[mask], np.asarray(wf)[mask], rtol=1e-5, atol=1e-6
+    )
+    np.testing.assert_allclose(
+        np.asarray(got["d2Edq2"])[mask], np.asarray(d2)[mask], rtol=1e-5, atol=1e-6
+    )
+    np.testing.assert_allclose(
+        np.asarray(got["bec_z"])[atoms], np.asarray(bec)[atoms], rtol=1e-4, atol=1e-6
+    )
+
+
+@pytest.mark.parametrize("mode", EXACT_MODES)
+def test_analytic_energy_and_forces_match_the_autodiff_route(mode):
+    """The fast path rebuilds energy and forces too, so they are checked with
+    the derivatives rather than assumed to have come along unchanged."""
+    model = _make_q_model(predict_bec=True, charge_conditioning=mode)
+    params = model.init(jax.random.key(0), *model.dummy_inputs())
+    batch = _slab_batch_at_charge(model, 0.4)
+
+    got = model.predict(params, batch)
+    energy, forces, _ = model._energy_and_grads(params, batch)
+
+    np.testing.assert_allclose(
+        np.asarray(got["energy"]), np.asarray(energy), rtol=1e-5, atol=1e-6
+    )
+    np.testing.assert_allclose(
+        np.asarray(got["forces"]), np.asarray(forces), rtol=1e-4, atol=1e-5
+    )
+
+
+def test_curvature_starts_at_softplus_of_kappa_init_whatever_the_size():
+    """`kappa_init` is an offset on the *structure* curvature, so a fresh model
+    reports softplus(kappa_init) -- the same number for a two-layer slab and a
+    four-layer one. The per-atom parameterisation it replaces started at
+    n_atoms * n_sites * softplus(bias) and moved with both."""
+    model = _make_q_model(predict_bec=True, charge_conditioning="quadratic")
+    params = model.init(jax.random.key(0), *model.dummy_inputs())
+
+    expected = float(jax.nn.softplus(0.0))
+    for size in ((1, 1, 2), (2, 1, 4)):
+        batch = _slab_batch_at_charge(model, 0.4, size=size)
+        d2 = np.asarray(model.predict(params, batch)["d2Edq2"])
+        mask = np.asarray(batch.sr.structure_mask)
+        np.testing.assert_allclose(d2[mask], expected, rtol=1e-5)
+
+
+def test_constant_curvature_does_not_depend_on_geometry():
+    """What makes `quadratic_const` the razor control: one K for every
+    structure, however the atoms are arranged."""
+    model = _make_q_model(predict_bec=True, charge_conditioning="quadratic_const")
+    key = jax.random.key(0)
+    params = model.init(key, *model.dummy_inputs())
+    # wake the head up, so a match is not just two untrained zeros agreeing
+    params = jax.tree_util.tree_map(
+        lambda x: x + 0.1 * jax.random.normal(key, x.shape), params
+    )
+
+    values = []
+    for size in ((1, 1, 2), (2, 1, 4)):
+        batch = _slab_batch_at_charge(model, 0.4, size=size)
+        d2 = np.asarray(model.predict(params, batch)["d2Edq2"])
+        values.append(d2[np.asarray(batch.sr.structure_mask)][0])
+
+    np.testing.assert_allclose(values[0], values[1], rtol=1e-6)
+
+
+def test_geometry_dependent_curvature_does_depend_on_geometry():
+    """The control is only a control if the default is not already constant."""
+    model = _make_q_model(predict_bec=True, charge_conditioning="quadratic")
+    key = jax.random.key(0)
+    params = model.init(key, *model.dummy_inputs())
+    params = jax.tree_util.tree_map(
+        lambda x: x + 0.1 * jax.random.normal(key, x.shape), params
+    )
+
+    values = []
+    for size in ((1, 1, 2), (2, 1, 4)):
+        batch = _slab_batch_at_charge(model, 0.4, size=size)
+        d2 = np.asarray(model.predict(params, batch)["d2Edq2"])
+        values.append(d2[np.asarray(batch.sr.structure_mask)][0])
+
+    assert abs(values[0] - values[1]) > 1e-4
