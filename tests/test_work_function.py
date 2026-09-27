@@ -19,7 +19,7 @@ TEST_MAX_DEGREE = 2
 HEADS = [True, False]
 
 
-def _make_model(from_energy=True, max_degree=TEST_MAX_DEGREE, cutoff=4.0, **kwargs):
+def _make_model(from_energy=True, max_degree=TEST_MAX_DEGREE, cutoff=4.0, lr=False, **kwargs):
     return LoremWF(
         cutoff=cutoff,
         max_degree=max_degree,
@@ -27,7 +27,7 @@ def _make_model(from_energy=True, max_degree=TEST_MAX_DEGREE, cutoff=4.0, **kwar
         num_spherical_features=2,
         num_radial=4,
         num_message_passing=1,
-        lr=False,
+        lr=lr,
         work_function_from_energy=from_energy,
         **kwargs,
     )
@@ -226,3 +226,138 @@ def test_plain_lorem_reports_no_work_function():
         "energy",
         "forces",
     }
+
+
+# -- work_function_head="dipole" --
+
+DIPOLE_HEADS = ["dipole", "dipole+pooled"]
+
+
+def _slab():
+    from ase.build import add_adsorbate, fcc111
+
+    atoms = fcc111("Au", (2, 2, 2), vacuum=6.0)
+    add_adsorbate(atoms, molecule("H2O"), 2.8, "ontop")
+    add_adsorbate(atoms, molecule("H2O"), 5.5, "fcc")
+    atoms.pbc = [True, True, False]
+    atoms.info["total_charge"] = 0.0
+    return atoms
+
+
+def _dipole_model(head="dipole", lr=False, **kwargs):
+    return _make_model(
+        from_energy=False, lr=lr, work_function_head=head, work_function_reference=5.0,
+        **kwargs,
+    )
+
+
+def _randomize_head(params, seed=1):
+    """The output layers start at zero; tests need a head that does something."""
+    head = params["params"]["DipoleHead_0"]
+    leaves, treedef = jax.tree.flatten(head)
+    keys = jax.random.split(jax.random.key(seed), len(leaves))
+    leaves = [0.5 * jax.random.normal(k, x.shape, x.dtype) for k, x in zip(keys, leaves)]
+    return {"params": {**params["params"], "DipoleHead_0": jax.tree.unflatten(treedef, leaves)}}
+
+
+def _phi(model, params, atoms):
+    return float(model.predict(params, model.atoms_to_batch(atoms))["work_function"][0])
+
+
+def test_dipole_head_starts_at_the_reference():
+    """Zero-initialised outputs: the head grows its dipole from nothing."""
+    model = _dipole_model()
+    params = _init(model)
+    assert _phi(model, params, _slab()) == pytest.approx(5.0, abs=1e-6)
+
+
+@pytest.mark.parametrize("lr", [False, True])
+def test_dipole_head_is_the_stated_formula(lr):
+    """Phi = Phi_ref - (sum q (z - z0) + p_z) / (eps0 A), with neutral charges."""
+    from lorem.models.work_function import INV_EPSILON_0
+
+    model = _dipole_model(lr=lr)
+    params = _randomize_head(_init(model))
+    atoms = _slab()
+    batch = model.atoms_to_batch(atoms)
+
+    terms = jax.tree.map(np.asarray, model.dipole_terms(params, batch))
+    n = len(atoms)
+    q, p = terms["charges"][:n], terms["dipoles_z"][:n]
+    assert np.all(terms["charges"][n:] == 0.0) and np.all(terms["dipoles_z"][n:] == 0.0)
+    assert abs(q.sum()) < 1e-5
+
+    z = atoms.positions[:, 2]
+    area = np.linalg.norm(np.cross(atoms.cell[0], atoms.cell[1]))
+    reference = float(params["params"]["DipoleHead_0"]["reference"][0])
+    expected = reference - INV_EPSILON_0 * (np.sum(q * (z - z.mean())) + p.sum()) / area
+
+    np.testing.assert_allclose(_phi(model, params, atoms), expected, rtol=1e-4, atol=1e-4)
+    # 1/(eps0 A) on explicit's 17.80 x 10.28 Å cell, as quoted in the notes
+    assert INV_EPSILON_0 / (17.7991929 * 10.27636881) == pytest.approx(0.9893, abs=1e-4)
+
+
+@pytest.mark.parametrize("head", DIPOLE_HEADS)
+def test_dipole_head_symmetries(head):
+    """Invariant to translations and to rotations about the normal; odd under
+    the mirror z -> -z; and NOT invariant to a rotation that tilts the normal."""
+    model = _dipole_model(head)
+    params = _randomize_head(_init(model))
+    atoms = _slab()
+    phi = _phi(model, params, atoms)
+    reference = float(params["params"]["DipoleHead_0"]["reference"][0])
+
+    moved = atoms.copy()
+    moved.positions += np.array([1.3, -0.7, 2.1])
+    np.testing.assert_allclose(_phi(model, params, moved), phi, atol=1e-4)
+
+    theta = 0.7
+    Rz = np.array([[np.cos(theta), -np.sin(theta), 0], [np.sin(theta), np.cos(theta), 0], [0, 0, 1]])
+    turned = atoms.copy()
+    turned.set_cell(atoms.cell[:] @ Rz.T, scale_atoms=False)
+    turned.positions = atoms.positions @ Rz.T
+    np.testing.assert_allclose(_phi(model, params, turned), phi, atol=1e-4)
+
+    if head == "dipole":
+        mirrored = atoms.copy()
+        mirrored.positions[:, 2] *= -1.0
+        np.testing.assert_allclose(
+            _phi(model, params, mirrored) - reference, -(phi - reference), atol=1e-4
+        )
+
+    Rx = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], dtype=float)
+    tilted = atoms.copy()
+    tilted.positions = atoms.positions @ Rx.T
+    tilted.set_cell(atoms.cell[:] @ Rx.T, scale_atoms=False)
+    tilted.pbc = [True, False, True]
+    assert abs(_phi(model, params, tilted) - phi) > 1e-3
+
+
+@pytest.mark.parametrize("head", DIPOLE_HEADS)
+def test_dipole_head_padding_and_side_output(head):
+    model = _dipole_model(head)
+    params = _randomize_head(_init(model))
+    batch = model.atoms_to_batch(_slab())
+    before = model.predict(params, batch)
+
+    assert not bool(batch.sr.structure_mask[1])
+    assert float(before["work_function"][1]) == 0.0
+
+    perturbed = _randomize_head(params, seed=2)
+    after = model.predict(perturbed, batch)
+    np.testing.assert_array_equal(after["energy"], before["energy"])
+    np.testing.assert_array_equal(after["forces"], before["forces"])
+    assert not np.allclose(after["work_function"], before["work_function"])
+
+
+def test_pooled_head_params_are_unchanged_by_the_new_field():
+    """Existing pooled checkpoints must still load: same parameter tree."""
+    old = _make_model(from_energy=False)
+    new = _make_model(from_energy=False, work_function_head="pooled")
+    shapes = lambda m: jax.tree.map(lambda x: x.shape, _init(m))
+    assert shapes(old) == shapes(new)
+
+
+def test_unknown_head_raises():
+    with pytest.raises(ValueError, match="work_function_head"):
+        _init(_make_model(from_energy=False, work_function_head="nonsense"))

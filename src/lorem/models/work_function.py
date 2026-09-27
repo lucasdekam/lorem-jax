@@ -40,8 +40,13 @@ class LoremWF(nn.Module):
     num_message_passing: int = 0
     equivariant_message_passing: bool = True
     initialize_node_features: bool = True
-    # False routes Phi to its own pooled head instead of the energy derivative
+    # False routes Phi to its own head instead of the energy derivative
     work_function_from_energy: bool = True
+    # which head, when work_function_from_energy is False: "pooled", "dipole",
+    # or "dipole+pooled" (the dipole head plus a pooled residual)
+    work_function_head: str = "pooled"
+    # starting value of the dipole head's trainable Phi_ref, in V
+    work_function_reference: float = 0.0
 
     @property
     def to_batch(self):
@@ -60,6 +65,11 @@ class LoremWF(nn.Module):
         pbc,
         Q,
     ):
+        if self.work_function_head not in ("pooled", "dipole", "dipole+pooled"):
+            raise ValueError(f"unknown work_function_head: {self.work_function_head}")
+        if "dipole" in self.work_function_head and self.max_degree < 1:
+            raise ValueError("the dipole head reads l=1 features: max_degree must be >= 1")
+
         R = sr.positions
         i = sr.centers
         j = sr.others
@@ -258,9 +268,20 @@ class LoremWF(nn.Module):
             energy += masked(MLP(features=[d, d, 1]), nodes_scalar, atom_mask)[..., 0]
 
         if self.work_function_from_energy:
-            work_function = None
-        else:
-            work_function = PooledScalarHead(features=d)(stages, sr)
+            return energy, None
+
+        work_function = 0.0
+        if "dipole" in self.work_function_head:
+            # the last-stage features: nodes_scalar already carries the LR
+            # update, and the LR-modulated spherical features join the local ones
+            spherical = nodes_spherical
+            if self.lr:
+                spherical = jnp.concatenate([nodes_spherical, spherical_updates], axis=-1)
+            work_function += DipoleHead(
+                features=d, reference=self.work_function_reference
+            )(nodes_scalar, spherical, sr)
+        if "pooled" in self.work_function_head:
+            work_function += PooledScalarHead(features=d)(stages, sr)
 
         return energy, work_function
 
@@ -295,6 +316,20 @@ class LoremWF(nn.Module):
         # only the sum is differentiated, so the head cannot reach the forces;
         # it still trains, through `aux`
         return jnp.sum(energies), (energies, work_function)
+
+    def dipole_terms(self, params, batch):
+        """Per-atom charges (e) and z-dipoles (e*Å) of the dipole head."""
+        _, state = self.apply(
+            params,
+            batch.atomic_numbers,
+            batch.sr,
+            batch.nopbc,
+            batch.pbc,
+            batch.total_charge,
+            mutable=["intermediates"],
+        )
+        head = state["intermediates"]["DipoleHead_0"]
+        return {"charges": head["charges"][0], "dipoles_z": head["dipoles_z"][0]}
 
     def predict(self, params, batch, stress=False):
         sr = batch[1]
@@ -338,6 +373,80 @@ class LoremWF(nn.Module):
             results["stress"] = stress
 
         return results
+
+
+# e / (eps0 * 1 Å), in V: turns a dipole in e*Å over an area in Å^2 into volts
+INV_EPSILON_0 = 1.602176634e-19 / (8.8541878128e-12 * 1e-10)
+
+
+# Phi = Phi_ref - (sum_i q_i z_i + p_z,i) / (eps0 A): the work function is the
+# clean-metal value shifted by the interfacial z-dipole (Helmholtz). The dipole
+# is built from per-atom charges times heights and per-atom l=1 dipoles, so it
+# is signed along z by construction -- a mean over invariant features is blind
+# to a molecule's orientation relative to the surface normal.
+#
+# Only valid for slabs normal to Cartesian z with unwrapped z positions
+# (pbc = T T F); the in-plane area is |a x b| of each structure's cell.
+class DipoleHead(nn.Module):
+    features: int
+    reference: float = 0.0
+
+    @nn.compact
+    def __call__(self, nodes_scalar, nodes_spherical, sr):
+        num_structures = sr.cell.shape[0]
+        atom_to_structure = sr.atom_to_structure
+        atom_mask = sr.atom_mask
+
+        def per_structure(x):
+            return jax.ops.segment_sum(x, atom_to_structure, num_structures)
+
+        # -- charges, neutral per structure --
+        # the output layers start at zero, so Phi starts at Phi_ref and the head
+        # grows its dipole from nothing instead of from a random one of many volts
+        hidden = masked(
+            lambda x: jax.nn.silu(nn.Dense(self.features)(x)), nodes_scalar, atom_mask
+        )
+        raw = masked(
+            nn.Dense(1, kernel_init=nn.initializers.zeros), hidden, atom_mask
+        )[..., 0]
+        # the excess is handed back in proportion to a learned softness, so the
+        # compensating charge can sit on the metal instead of at the centroid
+        softness = masked(
+            lambda x: jax.nn.softplus(nn.Dense(1)(x)), nodes_scalar, atom_mask
+        )[..., 0]
+        softness = (softness + 1e-6) * atom_mask
+        excess = per_structure(raw) / jnp.maximum(per_structure(softness), 1e-6)
+        charges = (raw - softness * excess[atom_to_structure]) * atom_mask
+
+        # -- dipoles: the l=1 block projected on z --
+        dipoles = e3x.nn.Dense(1, use_bias=False, kernel_init=nn.initializers.zeros)(
+            nodes_spherical
+        )[:, 0, 1:4, 0]
+        z_hat = e3x.so3.spherical_harmonics(
+            jnp.array([0.0, 0.0, 1.0]), 1, r_is_normalized=True
+        )[1:4]
+        dipoles_z = (dipoles @ (z_hat / jnp.linalg.norm(z_hat))) * atom_mask
+
+        # neutral charges make this independent of the origin; the centroid
+        # only keeps the numbers small
+        z = sr.positions[:, 2]
+        counts = jnp.maximum(per_structure(atom_mask.astype(z.dtype)), 1.0)
+        z0 = per_structure(z * atom_mask) / counts
+        dipole = per_structure(charges * (z - z0[atom_to_structure]) + dipoles_z)
+
+        area = jnp.linalg.norm(jnp.cross(sr.cell[:, 0, :], sr.cell[:, 1, :]), axis=-1)
+        area = jnp.where(sr.structure_mask, area, 1.0)
+
+        # 1-d rather than a scalar so optimizers treat it like a bias
+        phi_ref = self.param(
+            "reference", nn.initializers.constant(self.reference), (1,)
+        )[0]
+
+        if self.is_mutable_collection("intermediates") and not self.is_initializing():
+            self.sow("intermediates", "charges", charges)
+            self.sow("intermediates", "dipoles_z", dipoles_z)
+
+        return (phi_ref - INV_EPSILON_0 * dipole / area) * sr.structure_mask
 
 
 # CP-MACE's Fermi-level readout: every stage's invariant node features
