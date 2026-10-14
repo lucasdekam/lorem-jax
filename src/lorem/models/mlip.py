@@ -9,19 +9,19 @@ from lorem.models.backbone import (
     MLP,
     ChargeConditioning,
     QuadraticReadout,
+    EPSILON_0,
     Initial,
     RadialCoefficients,
     Update,
+    charge_field,
     degree_wise_repeat_last_axis,
+    field_invariants,
     spherical_norm_last_axis,
 )
 from lorem.models.backbone import (
     _masked as masked,
 )
 from lorem.transforms import ToBatch, ToSample
-
-# vacuum permittivity in e^2 / (eV * Angstrom)
-EPSILON_0 = 0.005526349406
 
 
 class Lorem(nn.Module):
@@ -59,6 +59,16 @@ class Lorem(nn.Module):
     num_message_passing: int = 0
     equivariant_message_passing: bool = True
     initialize_node_features: bool = True
+    # couple a uniform field (batch.external_field, V/A) to the node features,
+    # to second order in the field: see `field_invariants`. Applied once per
+    # block that builds spherical features, all before the Ewald step, so the
+    # long-range charges can carry the induced response.
+    field_conditioning: bool = False
+    # add the field q / (eps0 A) of the structure's own charge to the external
+    # one, along the a x b normal on the +c side (`charge_field`), so that
+    # dE/dq picks up the field path too. Every structure is then taken to be a
+    # slab in the a-b plane with its counter charge above it, as in GPAW-SJM.
+    field_from_charge: bool = False
 
     @property
     def to_batch(self):
@@ -68,12 +78,12 @@ class Lorem(nn.Module):
     def to_sample(self):
         return ToSample
 
-    def __call__(self, Z_i, sr, nopbc, pbc, Q):
+    def __call__(self, Z_i, sr, nopbc, pbc, Q, field):
         """Per-atom energies -- the contract every caller but `LoremQ` uses."""
-        return self.coefficients(Z_i, sr, nopbc, pbc, Q)[0]
+        return self.coefficients(Z_i, sr, nopbc, pbc, Q, field)[0]
 
     @nn.compact
-    def coefficients(self, Z_i, sr, nopbc, pbc, Q):
+    def coefficients(self, Z_i, sr, nopbc, pbc, Q, field):
         """Per-atom energies, plus the charge expansion's structure-level terms.
 
         Returns `(energy_i, B_s, K_s)`. In the exactly-quadratic modes
@@ -115,6 +125,18 @@ class Lorem(nn.Module):
         s = self.num_spherical_features
 
         Q_i = Q[atom_to_structure] * atom_mask
+
+        if self.field_from_charge and not self.field_conditioning:
+            raise ValueError("field_from_charge needs field_conditioning")
+        if self.field_from_charge:
+            field = field + charge_field(Q, cell)
+        E_i = field[atom_to_structure] * atom_mask[..., None]
+
+        def condition_on_field(nodes_scalar, nodes_spherical):
+            if not self.field_conditioning:
+                return nodes_scalar
+            invariants = field_invariants(E_i, nodes_scalar, nodes_spherical, max_degree)
+            return Update(d)(nodes_scalar, invariants, atom_mask)
 
         modes = ("film", "quadratic", "quadratic_const", "quadratic_film")
         if self.charge_conditioning not in modes:
@@ -222,6 +244,9 @@ class Lorem(nn.Module):
             nodes_spherical
         )
 
+        # side branch: nodes_spherical itself stays geometry-only
+        nodes_scalar = condition_on_field(nodes_scalar, nodes_spherical)
+
         # -- mix equivariant information into scalar node features --
         norms = spherical_norm_last_axis(nodes_spherical, max_degree)
         updates = (norms * l_factors[None, None, :, None]).reshape(num_atoms, -1)
@@ -278,6 +303,8 @@ class Lorem(nn.Module):
                     e3x.nn.Dense(use_bias=False, features=s)(nodes_spherical),
                     e3x.nn.Dense(use_bias=False, features=s)(messages),
                 )
+
+                nodes_scalar = condition_on_field(nodes_scalar, nodes_spherical)
 
                 norms = spherical_norm_last_axis(nodes_spherical, max_degree)
                 updates = (norms * l_factors[None, None, :, None]).reshape(num_atoms, -1)
@@ -386,6 +413,11 @@ class Lorem(nn.Module):
             # describe it and must not be handed out as though they did
             B_s = K_s = None
 
+        if self.field_from_charge:
+            # q also reaches the features through the field, so E(q) is no
+            # longer the quadratic the coefficients describe
+            B_s = K_s = None
+
         return energy, B_s, K_s
 
     def atoms_to_batch(self, atoms):
@@ -401,6 +433,7 @@ class Lorem(nn.Module):
 
         atoms = bulk("Ar") * [2, 2, 2]
         atoms.info["total_charge"] = 0.0
+        atoms.info["external_field"] = [0.0, 0.0, 0.0]
 
         return self.atoms_to_batch(atoms)[:-1]
 
@@ -413,6 +446,7 @@ class Lorem(nn.Module):
             batch.nopbc,
             batch.pbc,
             batch.total_charge,
+            batch.external_field,
         )
         energies *= sr.atom_mask
 
@@ -505,11 +539,30 @@ class LoremQ(Lorem):
 
     For `film` and `quadratic_film` E(q) is not quadratic and the derivative is
     the only honest answer, so those keep the autodiff route.
+
+    With `field_conditioning` the same holds for the field input
+    (`external_field`, V/A), and `predict` adds:
+
+    - `dEdfield` = dE/dE_field, minus the cell's dipole (e A). Free, like the
+      work function.
+    - `apt` = dF/dE_field, [atom, force component, field component], the
+      atomic polar tensor (Born effective charge, e) in LoremBEC's layout, so
+      the Calculator exposes it as `born_effective_charges`.
+    - `d2Edfield2` = d2E/dE_field2, minus the polarizability (e A^2 / V).
+      Both of these cost a forward-over-reverse pass per field component, so
+      they stay behind `predict_field_response`.
+
+    These are derivatives with respect to `external_field` at fixed q. With
+    `field_from_charge` the field of q itself is added inside the model, so
+    `work_function` = dE/dq already includes the field path,
+    dE/dq = dE/dq|_field + n . dE/dE_field / (eps0 A).
     """
 
     # off by default: unlike the work function this is not free, so only runs
     # that actually supervise it should pay for it
     predict_bec: bool = False
+    # the same for `apt` and `d2Edfield2`
+    predict_field_response: bool = False
 
     def _charge_second_derivatives(self, params, batch):
         """Born effective charges, as the mixed second derivative.
@@ -555,6 +608,39 @@ class LoremQ(Lorem):
         bec_z = -d2E_drdq * self._bec_scale(sr) * sr.atom_mask[:, None]
         return bec_z, d2E_dq2 * sr.structure_mask
 
+    def _field_second_derivatives(self, params, batch):
+        """dF/dE_field and d2E/dE_field2, one forward-over-reverse pass per
+        field component.
+
+        As for the charge: structures don't interact, so a tangent along one
+        Cartesian component of every structure's field at once hands each atom
+        its own structure's derivative.
+        """
+        sr = batch[1]
+
+        def first_derivatives(field):
+            def energy_of(positions, field):
+                shifted = batch._replace(
+                    sr=sr._replace(positions=positions),
+                    external_field=field,
+                )
+                return self.energy(params, shifted)[0]
+
+            return jax.grad(energy_of, argnums=(0, 1))(sr.positions, field)
+
+        def along(direction):
+            tangent = jnp.broadcast_to(
+                jax.nn.one_hot(direction, 3, dtype=batch.external_field.dtype),
+                batch.external_field.shape,
+            )
+            return jax.jvp(first_derivatives, (batch.external_field,), (tangent,))[1]
+
+        # trailing axis is the field component
+        d2E_drdE, d2E_dE2 = jax.vmap(along, out_axes=-1)(jnp.arange(3))
+
+        apt = -d2E_drdE * sr.atom_mask[:, None, None]
+        return apt, d2E_dE2 * sr.structure_mask[:, None, None]
+
     @staticmethod
     def _bec_scale(sr):
         """A eps0, per atom -- what turns d2E/(dr dq) into a dimensionless Z*.
@@ -569,7 +655,12 @@ class LoremQ(Lorem):
     def _exactly_quadratic(self):
         """Whether E(q) is a quadratic the model states rather than one autodiff
         has to uncover."""
-        return self.charge_conditioning in ("quadratic", "quadratic_const")
+        # the analytic route has no field derivatives, and with
+        # field_from_charge E(q) is not quadratic anyway
+        return (
+            self.charge_conditioning in ("quadratic", "quadratic_const")
+            and not self.field_conditioning
+        )
 
     def _predict_quadratic(self, params, batch, stress=False):
         """The analytic route, for the modes where E(q) is exactly quadratic.
@@ -592,6 +683,7 @@ class LoremQ(Lorem):
                 shifted.nopbc,
                 shifted.pbc,
                 shifted.total_charge,
+                shifted.external_field,
                 method=Lorem.coefficients,
             )
             phi = (B_s + K_s * shifted.total_charge) * sr.structure_mask
@@ -651,6 +743,16 @@ class LoremQ(Lorem):
             bec_z, d2Edq2 = self._charge_second_derivatives(params, batch)
             results["bec_z"] = bec_z
             results["d2Edq2"] = d2Edq2
+
+        if self.field_conditioning:
+            results["dEdfield"] = (
+                batch_grads.external_field * sr.structure_mask[:, None]
+            )
+
+            if self.predict_field_response:
+                apt, d2Edfield2 = self._field_second_derivatives(params, batch)
+                results["apt"] = apt
+                results["d2Edfield2"] = d2Edfield2
 
         if stress:
             results["stress"] = self._stress(sr, batch_grads.sr)

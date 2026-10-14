@@ -9,7 +9,12 @@ from ase.calculators.singlepoint import SinglePointCalculator
 
 from lorem.batching import to_batch, to_sample
 from lorem.calculator import Calculator
-from lorem.models.backbone import ChargeConditioning
+from lorem.models.backbone import (
+    EPSILON_0,
+    ChargeConditioning,
+    charge_field,
+    field_invariants,
+)
 from lorem.models.bec import LoremBEC
 from lorem.models.mlip import Lorem, LoremQ
 
@@ -604,3 +609,349 @@ def test_geometry_dependent_curvature_does_depend_on_geometry():
         values.append(d2[np.asarray(batch.sr.structure_mask)][0])
 
     assert abs(values[0] - values[1]) > 1e-4
+
+
+# -- field conditioning --
+#
+# The field enters as the l=0 outputs of its CG product with the node
+# features, up to second order: |E|^2 h, E . v and Y_2(E) . T. These pin the
+# plumbing, the symmetry, the polynomial order (no |E| term, so no kink at
+# zero field), and the field derivatives `predict` hands out.
+
+
+def _make_field_model(field_from_charge=False, predict_field_response=False,
+                      max_degree=TEST_MAX_DEGREE, lr=False, **kwargs):
+    return LoremQ(
+        cutoff=4.0,
+        max_degree=max_degree,
+        num_features=8,
+        num_spherical_features=2,
+        num_radial=4,
+        num_message_passing=1,
+        lr=lr,
+        field_conditioning=True,
+        field_from_charge=field_from_charge,
+        predict_field_response=predict_field_response,
+        **kwargs,
+    )
+
+
+def _batch_in_field(model, field, q=0.0, atoms=None):
+    atoms = molecule("H2O") if atoms is None else atoms.copy()
+    atoms.info["total_charge"] = q
+    atoms.info["external_field"] = list(field)
+    return model.atoms_to_batch(atoms)
+
+
+FIELD = (0.3, -0.2, 0.5)
+
+
+def test_external_field_flows_through_batch():
+    batch = _batch_in_field(_make_field_model(), FIELD)
+    np.testing.assert_allclose(batch.external_field[0], FIELD)
+
+
+def test_external_field_defaults_to_zero():
+    sample = to_sample(molecule("H2O"), cutoff=5.0, energy=False, forces=False, stress=False)
+    assert np.allclose(to_batch([sample], []).external_field[0], 0.0)
+
+
+def test_external_field_survives_marathon_prepare_roundtrip(tmp_path):
+    from marathon.grain import DataSource, prepare
+
+    def make(field):
+        atoms = molecule("H2O")
+        atoms.info["external_field"] = field
+        atoms.calc = SinglePointCalculator(
+            atoms, energy=0.0, forces=np.zeros((len(atoms), 3))
+        )
+        return atoms
+
+    properties = {
+        "energy": {"shape": (1,), "storage": "atoms.calc"},
+        "forces": {"shape": ("atom", 3), "storage": "atoms.calc"},
+        "external_field": {"shape": (3,), "storage": "atoms.info"},
+    }
+    prepare(
+        [make([1.0, 0.0, 0.0]), make([0.0, -1.0, 0.0])],
+        folder=tmp_path / "ds",
+        properties=properties,
+    )
+
+    src = DataSource(tmp_path / "ds")
+    values = sorted(
+        tuple(np.asarray(src[i].info["external_field"]).tolist()) for i in range(len(src))
+    )
+    assert values == [(0.0, -1.0, 0.0), (1.0, 0.0, 0.0)]
+
+
+def test_field_invariants_are_homogeneous_in_the_field():
+    """Each block scales with its order: |E|^2 h and Y_2(E) . T as t^2, E . v
+    as t. A norm-based coupling would scale every block as t."""
+    key = jax.random.key(0)
+    num_atoms, d, s, max_degree = 3, 5, 4, 2
+    k1, k2, k3 = jax.random.split(key, 3)
+    E = jax.random.normal(k1, (num_atoms, 3))
+    h = jax.random.normal(k2, (num_atoms, d))
+    V = jax.random.normal(k3, (num_atoms, 1, (max_degree + 1) ** 2, s))
+
+    f1 = field_invariants(E, h, V, max_degree)
+    f2 = field_invariants(2.0 * E, h, V, max_degree)
+
+    assert f1.shape == (num_atoms, d + 2 * s)
+    np.testing.assert_allclose(f2[:, :d], 4.0 * f1[:, :d], rtol=1e-5)
+    np.testing.assert_allclose(f2[:, d : d + s], 2.0 * f1[:, d : d + s], rtol=1e-5)
+    np.testing.assert_allclose(f2[:, d + s :], 4.0 * f1[:, d + s :], rtol=1e-5)
+
+
+def test_field_invariants_l2_block_is_the_quadratic_form():
+    """Y_2(E) . T equals E^T M E for the symmetric traceless matrix M that T
+    represents -- the reason the field enters as solid harmonics."""
+    key = jax.random.key(1)
+    k1, k2 = jax.random.split(key)
+    E = jax.random.normal(k1, (1, 3))
+    a = jax.random.normal(k2, (3, 3))
+    M = 0.5 * (a + a.T)
+    M = M - jnp.trace(M) / 3.0 * jnp.eye(3)
+
+    # the l=2 coefficients of M: project onto the solid harmonics, which are
+    # quadratic forms themselves, Y_2m(x) = x^T B_m x
+    B = jax.jacfwd(jax.jacfwd(lambda x: e3x.so3.solid_harmonics(x, 2)[4:]))(
+        jnp.zeros(3)
+    ) / 2.0  # [5, 3, 3]
+    T = jnp.linalg.solve(
+        jnp.einsum("mab,nab->mn", B, B), jnp.einsum("mab,ab->m", B, M)
+    )
+    V = jnp.zeros((1, 1, 9, 1)).at[0, 0, 4:, 0].set(T)
+
+    f = field_invariants(E, jnp.zeros((1, 1)), V, 2)
+    np.testing.assert_allclose(f[0, -1], E[0] @ M @ E[0], rtol=1e-4)
+
+
+def test_field_conditioning_off_ignores_field():
+    model = _make_q_model()
+    params = model.init(jax.random.key(0), *model.dummy_inputs())
+    e0 = model.predict(params, _batch_in_field(model, (0, 0, 0)))["energy"][0]
+    e1 = model.predict(params, _batch_in_field(model, FIELD))["energy"][0]
+    assert float(e0) == float(e1)
+    assert "dEdfield" not in model.predict(params, _batch_in_field(model, FIELD))
+
+
+def test_field_conditioning_is_direction_and_sign_sensitive():
+    model = _make_field_model()
+    params = model.init(jax.random.key(0), *model.dummy_inputs())
+
+    def energy(field):
+        return float(model.predict(params, _batch_in_field(model, field))["energy"][0])
+
+    e = energy(FIELD)
+    assert not np.isclose(e, energy([-x for x in FIELD]), atol=1e-6)
+    assert not np.isclose(e, energy([FIELD[1], FIELD[2], FIELD[0]]), atol=1e-6)
+
+
+@pytest.mark.parametrize("lr", [False, True])
+def test_field_conditioning_is_rotation_equivariant(lr):
+    """Rotating structure and field together leaves E invariant and rotates F
+    and dE/dE_field. At max_degree 6, where a degree-specific bug would show."""
+    R = np.array(e3x.so3.random_rotation(jax.random.key(0)))
+    model = _make_field_model(max_degree=6, lr=lr)
+    params = model.init(jax.random.key(0), *model.dummy_inputs())
+
+    atoms = molecule("H2O")
+    atoms_rot = atoms.copy()
+    atoms_rot.positions = atoms.positions @ R.T
+
+    p = model.predict(params, _batch_in_field(model, FIELD, atoms=atoms))
+    p_rot = model.predict(
+        params, _batch_in_field(model, np.array(FIELD) @ R.T, atoms=atoms_rot)
+    )
+
+    np.testing.assert_allclose(p["energy"][0], p_rot["energy"][0], atol=1e-4)
+    np.testing.assert_allclose(
+        np.asarray(p["forces"][:3]) @ R.T, p_rot["forces"][:3], atol=1e-4
+    )
+    np.testing.assert_allclose(
+        np.asarray(p["dEdfield"][0]) @ R.T, p_rot["dEdfield"][0], atol=1e-4
+    )
+
+
+def test_dEdfield_matches_central_difference():
+    model = _make_field_model()
+    params = model.init(jax.random.key(0), *model.dummy_inputs())
+
+    got = model.predict(params, _batch_in_field(model, FIELD))["dEdfield"][0]
+
+    h = 5e-3
+    expected = []
+    for a in range(3):
+        plus, minus = np.array(FIELD), np.array(FIELD)
+        plus[a] += h
+        minus[a] -= h
+        e_p = model.predict(params, _batch_in_field(model, plus))["energy"][0]
+        e_m = model.predict(params, _batch_in_field(model, minus))["energy"][0]
+        expected.append((e_p - e_m) / (2.0 * h))
+
+    np.testing.assert_allclose(got, expected, rtol=1e-3, atol=1e-4)
+
+
+@pytest.mark.parametrize("field", [(0.0, 0.0, 0.0), FIELD])
+def test_d2Edfield2_matches_difference_of_dEdfield(field):
+    """At zero field too: a |E| term would make dE/dE_field jump across E = 0,
+    and the difference quotient there would blow up as 1/h instead of
+    matching the Hessian."""
+    model = _make_field_model(predict_field_response=True)
+    params = model.init(jax.random.key(0), *model.dummy_inputs())
+
+    got = model.predict(params, _batch_in_field(model, field))["d2Edfield2"][0]
+    np.testing.assert_allclose(got, np.asarray(got).T, atol=1e-4)
+
+    h = 5e-3
+    columns = []
+    for b in range(3):
+        plus, minus = np.array(field, dtype=float), np.array(field, dtype=float)
+        plus[b] += h
+        minus[b] -= h
+        g_p = model.predict(params, _batch_in_field(model, plus))["dEdfield"][0]
+        g_m = model.predict(params, _batch_in_field(model, minus))["dEdfield"][0]
+        columns.append((g_p - g_m) / (2.0 * h))
+    expected = np.stack(columns, axis=-1)
+
+    np.testing.assert_allclose(got, expected, rtol=1e-2, atol=1e-3)
+
+
+def test_apt_matches_finite_difference_of_forces():
+    model = _make_field_model(predict_field_response=True)
+    params = model.init(jax.random.key(0), *model.dummy_inputs())
+
+    got = np.asarray(model.predict(params, _batch_in_field(model, FIELD))["apt"][:3])
+
+    h = 5e-3
+    columns = []
+    for b in range(3):
+        plus, minus = np.array(FIELD), np.array(FIELD)
+        plus[b] += h
+        minus[b] -= h
+        f_p = model.predict(params, _batch_in_field(model, plus))["forces"][:3]
+        f_m = model.predict(params, _batch_in_field(model, minus))["forces"][:3]
+        columns.append((f_p - f_m) / (2.0 * h))
+    expected = np.stack(columns, axis=-1)  # [atom, force, field]
+
+    np.testing.assert_allclose(got, expected, rtol=1e-2, atol=1e-3)
+
+
+def test_field_outputs_absent_unless_requested_and_zero_on_padding():
+    model = _make_field_model(predict_field_response=True)
+    params = model.init(jax.random.key(0), *model.dummy_inputs())
+    batch = _batch_in_field(model, FIELD)
+    p = model.predict(params, batch)
+
+    atom_pad = ~np.asarray(batch.sr.atom_mask).astype(bool)
+    structure_pad = ~np.asarray(batch.sr.structure_mask).astype(bool)
+    assert atom_pad.any() and structure_pad.any()
+    assert np.allclose(np.asarray(p["apt"])[atom_pad], 0.0)
+    assert np.allclose(np.asarray(p["d2Edfield2"])[structure_pad], 0.0)
+    assert np.allclose(np.asarray(p["dEdfield"])[structure_pad], 0.0)
+
+    plain = _make_field_model()
+    p = plain.predict(params, batch)
+    assert "dEdfield" in p and "apt" not in p and "d2Edfield2" not in p
+
+
+def test_charge_field_is_gauss_law_along_the_normal():
+    from ase.build import fcc111
+
+    atoms = fcc111("Al", size=(1, 1, 2), vacuum=6.0)
+    cell = jnp.asarray(atoms.cell.array)[None]
+    area = np.linalg.norm(np.cross(atoms.cell[0], atoms.cell[1]))
+
+    field = charge_field(jnp.array([0.4]), cell)[0]
+    np.testing.assert_allclose(field, [0, 0, 0.4 / (EPSILON_0 * area)], rtol=1e-5)
+
+    # no 2D cell, no field
+    assert np.allclose(charge_field(jnp.array([0.4]), jnp.zeros((1, 3, 3))), 0.0)
+
+
+def test_field_from_charge_needs_field_conditioning():
+    model = _make_q_model().clone(field_from_charge=True)
+    with pytest.raises(ValueError, match="field_conditioning"):
+        model.init(jax.random.key(0), *model.dummy_inputs())
+
+
+def test_field_from_charge_is_the_same_as_the_field_it_implies():
+    """With field_from_charge, a slab at q is the plain field model at q with
+    the external field q/(eps0 A) n, and dE/dq picks up the field path:
+    dE/dq = dE/dq|_field + n . dE/dE_field / (eps0 A)."""
+    from ase.build import fcc111
+
+    model = _make_field_model(field_from_charge=True)
+    params = model.init(jax.random.key(0), *model.dummy_inputs())
+    plain = model.clone(field_from_charge=False)
+
+    atoms = fcc111("Al", size=(1, 1, 2), vacuum=6.0)
+    q = 0.4
+    scale = 1.0 / (EPSILON_0 * np.linalg.norm(np.cross(atoms.cell[0], atoms.cell[1])))
+
+    p = model.predict(params, _batch_in_field(model, (0, 0, 0), q=q, atoms=atoms))
+    p_plain = plain.predict(
+        params, _batch_in_field(plain, (0, 0, q * scale), q=q, atoms=atoms)
+    )
+
+    np.testing.assert_allclose(p["energy"][0], p_plain["energy"][0], rtol=1e-6)
+    np.testing.assert_allclose(
+        p["work_function"][0],
+        p_plain["work_function"][0] + scale * p_plain["dEdfield"][0, 2],
+        rtol=1e-4,
+        atol=1e-5,
+    )
+
+
+def test_field_from_charge_bec_z_matches_finite_difference_of_forces():
+    from ase.build import fcc111
+
+    model = _make_field_model(field_from_charge=True, predict_bec=True)
+    params = model.init(jax.random.key(0), *model.dummy_inputs())
+    atoms = fcc111("Al", size=(1, 1, 2), vacuum=6.0)
+    area = np.linalg.norm(np.cross(atoms.cell[0], atoms.cell[1]))
+
+    q0, h = 0.3, 5e-3
+    got = model.predict(params, _batch_in_field(model, (0, 0, 0), q=q0, atoms=atoms))
+    f_p = model.predict(params, _batch_in_field(model, (0, 0, 0), q=q0 + h, atoms=atoms))
+    f_m = model.predict(params, _batch_in_field(model, (0, 0, 0), q=q0 - h, atoms=atoms))
+    expected = area * EPSILON_0 * (f_p["forces"] - f_m["forces"]) / (2.0 * h)
+
+    n = len(atoms)
+    np.testing.assert_allclose(got["bec_z"][:n], expected[:n], rtol=1e-2, atol=1e-3)
+
+
+def test_quadratic_modes_fall_back_to_autodiff_with_a_field():
+    """The analytic route knows nothing about the field, so with field
+    conditioning it must not be taken -- and with field_from_charge E(q) is
+    not quadratic, so its coefficients must not be handed out either."""
+    model = _make_field_model(field_from_charge=True, charge_conditioning="quadratic")
+    assert not model._exactly_quadratic
+    params = model.init(jax.random.key(0), *model.dummy_inputs())
+    batch = _batch_in_field(model, (0, 0, 0), q=0.3)
+    _, B_s, K_s = model.apply(
+        params, batch.atomic_numbers, batch.sr, batch.nopbc, batch.pbc,
+        batch.total_charge, batch.external_field, method=Lorem.coefficients,
+    )
+    assert B_s is None and K_s is None
+    assert "dEdfield" in model.predict(params, batch)
+
+
+def test_calculator_picks_up_external_field_change_and_exposes_apt():
+    model = _make_field_model(predict_field_response=True)
+    params = model.init(jax.random.key(0), *model.dummy_inputs())
+
+    calc = Calculator.from_model(model, params=params)
+    assert "born_effective_charges" in calc.implemented_properties
+
+    atoms = molecule("H2O")
+    atoms.info["external_field"] = list(FIELD)
+    calc.calculate(atoms)
+    e_a = calc.results["energy"]
+    assert calc.results["born_effective_charges"].shape == (3, 3, 3)
+
+    atoms.info["external_field"] = [-x for x in FIELD]
+    calc.calculate(atoms)
+    assert not np.isclose(e_a, calc.results["energy"], atol=1e-6)

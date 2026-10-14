@@ -295,3 +295,55 @@ class QuadraticReadout(nn.Module):
             atom_mask,
         )[..., 0]
         return e0, phi0, kappa
+
+
+# -- field conditioning --
+
+# vacuum permittivity in e^2 / (eV * Angstrom)
+EPSILON_0 = 0.005526349406
+
+
+def field_invariants(E_i, nodes_scalar, nodes_spherical, max_degree):
+    """Every rotation invariant of a uniform field and the node features, to
+    second order in the field.
+
+        |E|^2 h_i         isotropic polarizability, on the scalar features
+        E . v_i           dipole, on the l=1 block
+        Y_2(E) . T_i      anisotropic polarizability, ~ E^T T_i E, on the l=2 block
+
+    These are the l=0 outputs of the CG product of the field with the node
+    features, which is why the field enters as its solid harmonics
+    Y_l(E) = |E|^l Y_l(E/|E|): the l=2 block of the features is a symmetric
+    traceless tensor stored as five real-spherical-harmonic components, and
+    E^T T E only sees the l=2 part of E E^T, which in that same basis *is*
+    Y_2(E). Solid rather than normalised harmonics keep every term a
+    polynomial in E, so the energy is analytic at E = 0 -- a norm of the CG
+    product would scale as |E| and put a kink there, i.e. a step in dE/dE and
+    a spike in d2E/dE2 at zero field.
+
+    `E_i` is [num_atoms, 3]; returns [num_atoms, d + min(max_degree, 2) * s].
+    """
+    harmonics = e3x.so3.solid_harmonics(E_i, min(max_degree, 2))
+    features = [jnp.sum(E_i**2, axis=-1, keepdims=True) * nodes_scalar]
+    for l in range(1, min(max_degree, 2) + 1):
+        lm = slice(l**2, (l + 1) ** 2)
+        features.append(
+            jnp.einsum("im,imc->ic", harmonics[:, lm], nodes_spherical[:, 0, lm, :])
+        )
+    return jnp.concatenate(features, axis=-1)
+
+
+def charge_field(Q, cell):
+    """The field q / (eps0 A) along the slab normal, per structure.
+
+    Gauss's law for a slab carrying q against a counter charge on its +c side,
+    as in GPAW-SJM's jellium: D = sigma n, with A = |a x b| and n the unit
+    normal on the side c points to. In V/A for q in e and lengths in A.
+    Structures without a 2D cell (A = 0) get no field.
+    """
+    normal = jnp.cross(cell[:, 0, :], cell[:, 1, :])
+    area = jnp.linalg.norm(normal, axis=-1)
+    side = jnp.sign(jnp.einsum("sa,sa->s", normal, cell[:, 2, :]))
+    safe_area = jnp.where(area > 0, area, 1.0)
+    scale = jnp.where(area > 0, side * Q / (EPSILON_0 * safe_area**2), 0.0)
+    return scale[:, None] * normal

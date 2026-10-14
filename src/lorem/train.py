@@ -157,6 +157,11 @@ def main():
     model = from_dict(model_config["model"])
     cutoff = model.cutoff
 
+    if use_rotational_augmentation and getattr(model, "field_conditioning", False):
+        # RandomRotation turns positions, cell, forces and stress, but not
+        # atoms.info["external_field"] or any field-derivative label
+        raise ValueError("rotational_augmentation does not rotate external_field")
+
     params = model.init(init_key, *model.dummy_inputs())
 
     if print_model_summary:
