@@ -7,7 +7,7 @@ from jaxpme.batched_mixed import Ewald
 
 from lorem.models.backbone import (
     MLP,
-    ChargeConditioning,
+    FiLM,
     Initial,
     RadialCoefficients,
     Update,
@@ -129,7 +129,7 @@ class LoremBEC(nn.Module):
 
         if self.charge_conditioning:
             Q_i = inputs["total_charge"][sr.atom_to_structure]
-            nodes_scalar = ChargeConditioning(d)(Q_i, nodes_scalar, atom_mask)
+            nodes_scalar = FiLM(d)(Q_i[..., None], nodes_scalar, atom_mask)
 
         coefficients = masked(
             nn.Dense(num_l * s, use_bias=False), edges_scalar, pair_mask

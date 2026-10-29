@@ -247,19 +247,29 @@ def spherical_norm_last_axis(X, max_degree):
     )(X)
 
 
-# -- charge conditioning --
+# -- conditioning --
 
 
-class ChargeConditioning(nn.Module):
-    # FiLM conditioning of invariant node features on the per-atom charge Q_i
+class FiLM(nn.Module):
+    # FiLM conditioning of invariant node features on per-atom scalars c_i,
+    # shape (num_atoms, num_conditions): the total charge Q and/or |E|^2
     features: int
 
     @nn.compact
-    def __call__(self, Q_i, x, atom_mask):
+    def __call__(self, c_i, x, atom_mask):
         gamma_beta = _masked(
             MLP(features=[self.features, 2 * self.features]),
-            Q_i[..., None],
+            c_i,
             atom_mask,
         )
         gamma, beta = jnp.split(gamma_beta, 2, axis=-1)
-        return (1.0 + gamma) * x + beta  # identity at Q=0
+        return (1.0 + gamma) * x + beta  # identity at c=0
+
+
+def field_harmonics(E_i):
+    # the field as an l=1 irrep, linear in E: r_is_normalized=True skips the
+    # normalisation, so the l=1 slots are the field itself (in e3x's ordering)
+    # and the coupling vanishes at E=0. The l=0 slot would be a constant 1.
+    harmonics = e3x.so3.spherical_harmonics(E_i, 1, r_is_normalized=True)
+    harmonics = harmonics.at[..., 0].set(0.0)
+    return harmonics[:, None, :, None]  # -> [num_atoms, 1, 4, 1]

@@ -7,11 +7,12 @@ from jaxpme.batched_mixed import Ewald
 
 from lorem.models.backbone import (
     MLP,
-    ChargeConditioning,
+    FiLM,
     Initial,
     RadialCoefficients,
     Update,
     degree_wise_repeat_last_axis,
+    field_harmonics,
     spherical_norm_last_axis,
 )
 from lorem.models.backbone import (
@@ -35,11 +36,22 @@ class Lorem(nn.Module):
     equivariant_message_passing: bool = True
     initialize_node_features: bool = True
     charge_conditioning: bool = False
+    # external_field (V/A, a 3-vector per structure): FiLM on |E|^2, plus a
+    # tensor product of the spherical features with E, linear in E
+    field_conditioning: bool = False
+    # also predict bec_z = dF/dE_z, the Born effective charges' z column (one
+    # forward-mode pass over the force computation)
+    predict_bec: bool = False
 
     @property
     def inputs(self):
         # properties read into batch.inputs
-        return ("total_charge",) if self.charge_conditioning else ()
+        inputs = ()
+        if self.charge_conditioning:
+            inputs += ("total_charge",)
+        if self.field_conditioning:
+            inputs += ("external_field",)
+        return inputs
 
     @property
     def to_batch(self):
@@ -127,9 +139,16 @@ class Lorem(nn.Module):
         )
         nodes_scalar = Update(d)(nodes_scalar, updates, atom_mask)
 
+        conditions = []
         if self.charge_conditioning:
-            Q_i = inputs["total_charge"][sr.atom_to_structure]
-            nodes_scalar = ChargeConditioning(d)(Q_i, nodes_scalar, atom_mask)
+            conditions.append(inputs["total_charge"][sr.atom_to_structure])
+        if self.field_conditioning:
+            E_i = inputs["external_field"][sr.atom_to_structure] * atom_mask[..., None]
+            # |E|^2, not |E|: smooth at E=0, so -dE/dE (the dipole) is defined there
+            conditions.append(jnp.sum(E_i**2, axis=-1))
+        if conditions:
+            c_i = jnp.stack(conditions, axis=-1)
+            nodes_scalar = FiLM(d)(c_i, nodes_scalar, atom_mask)
 
         coefficients = masked(
             nn.Dense(num_l * s, use_bias=False), edges_scalar, pair_mask
@@ -149,9 +168,21 @@ class Lorem(nn.Module):
             nodes_spherical
         )
 
+        if self.field_conditioning:
+            # -- couple the field into the spherical features --
+            # residual, so everything downstream (norms, message passing, LR
+            # charges) sees it; linear in E, so it is zero at zero field
+            field_coupled = e3x.nn.Tensor(
+                max_degree=max_degree, include_pseudotensors=False
+            )(nodes_spherical, e3x.nn.Dense(s, use_bias=False)(field_harmonics(E_i)))
+            nodes_spherical = nodes_spherical + field_coupled
+
         # -- mix equivariant information into scalar node features --
         norms = spherical_norm_last_axis(nodes_spherical, max_degree)
         updates = (norms * l_factors[None, None, :, None]).reshape(num_atoms, -1)
+        if self.field_conditioning:
+            # the l=0 output, E . (l=1 features): signed in E, which a norm is not
+            updates = jnp.concatenate([updates, field_coupled[:, 0, 0, :]], axis=-1)
 
         nodes_scalar = Update(d)(nodes_scalar, updates, atom_mask)
 
@@ -263,10 +294,14 @@ class Lorem(nn.Module):
         atoms = bulk("Ar") * [2, 2, 2]
         batch = self.atoms_to_batch(atoms)
 
+        mask = batch.sr.structure_mask
         inputs = {}
         if self.charge_conditioning:
-            inputs["total_charge"] = jnp.zeros_like(batch.sr.structure_mask, dtype=float)
-            inputs["total_charge_mask"] = batch.sr.structure_mask
+            inputs["total_charge"] = jnp.zeros_like(mask, dtype=float)
+            inputs["total_charge_mask"] = mask
+        if self.field_conditioning:
+            inputs["external_field"] = jnp.zeros((*mask.shape, 3), dtype=float)
+            inputs["external_field_mask"] = mask
 
         return batch._replace(inputs=inputs)[:5]
 
@@ -290,10 +325,12 @@ class Lorem(nn.Module):
         energy_and_derivatives_fn = jax.value_and_grad(
             self.energy, allow_int=True, has_aux=True, argnums=1
         )
-        batch_energy_and_atom_energies, grads = energy_and_derivatives_fn(params, batch)
+        batch_energy_and_atom_energies, batch_grads = energy_and_derivatives_fn(
+            params, batch
+        )
         _, energies = batch_energy_and_atom_energies
 
-        grads = grads.sr
+        grads = batch_grads.sr
 
         energy = (
             jax.ops.segment_sum(energies, sr.atom_to_structure, sr.cell.shape[0])
@@ -303,6 +340,20 @@ class Lorem(nn.Module):
         forces = -grads.positions
 
         results = {"energy": energy, "forces": forces}
+
+        # derivatives w.r.t. the conditioning inputs, from the same backward pass
+        if self.charge_conditioning:
+            # dE/dQ: the work function, for a charged electrode
+            results["work_function"] = (
+                batch_grads.inputs["total_charge"] * sr.structure_mask
+            )
+        if self.field_conditioning:
+            # mu = -dE/dE, the cell dipole (e A) conjugate to the field
+            dipole = -batch_grads.inputs["external_field"] * sr.structure_mask[:, None]
+            results["dipole"] = dipole
+            results["dipole_z"] = dipole[:, 2]
+            if self.predict_bec:
+                results["bec_z"] = self._bec_z(params, batch)
 
         if stress:
             stress = (
@@ -316,3 +367,23 @@ class Lorem(nn.Module):
             results["stress"] = stress
 
         return results
+
+    def _bec_z(self, params, batch):
+        # Z*_{i,az} = dF_ia/dE_z = -d2E/(dr_ia dE_z): forward mode along E_z
+        # through the force computation, one structure's field per structure
+        sr = batch.sr
+        field = batch.inputs["external_field"]
+
+        def forces_of(field):
+            b = batch._replace(inputs={**batch.inputs, "external_field": field})
+
+            def total_energy(positions):
+                return self.energy(params, b._replace(sr=sr._replace(positions=positions)))[
+                    0
+                ]
+
+            return -jax.grad(total_energy)(sr.positions)
+
+        tangent = jnp.zeros_like(field).at[:, 2].set(1.0)
+        _, bec_z = jax.jvp(forces_of, (field,), (tangent,))
+        return bec_z * sr.atom_mask[:, None]

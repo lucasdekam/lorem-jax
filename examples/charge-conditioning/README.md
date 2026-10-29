@@ -1,6 +1,6 @@
 # Training example: charge conditioning
 
-Trains `Lorem` on a small mixed-charge-state dataset, to check that conditioning the model on the total charge `Q` of a structure helps it tell charge states apart. With `charge_conditioning: true`, the model declares `total_charge` as an input and applies a FiLM layer (`ChargeConditioning` in `backbone.py`) to the scalar node features, which is the identity at `Q=0`.
+Trains `Lorem` on a small mixed-charge-state dataset, to check that conditioning the model on the total charge `Q` of a structure helps it tell charge states apart. With `charge_conditioning: true`, the model declares `total_charge` as an input and applies a FiLM layer (`FiLM` in `backbone.py`) to the scalar node features, which is the identity at `Q=0`.
 
 ## Data
 

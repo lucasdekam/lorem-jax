@@ -56,6 +56,9 @@ class Calculator(BaseCalculator):
             self.implemented_properties.append("stress")
         if bec:
             self.implemented_properties.append("born_effective_charges")
+        if "external_field" in self.inputs:
+            # field-conditioned Lorem: the dipole always, bec_z if predict_bec
+            self.implemented_properties += ["dipole", "bec_z"]
 
         predict_fn = lambda params, batch: pred_fn(params, batch, stress=stress)
 
@@ -228,6 +231,14 @@ class Calculator(BaseCalculator):
             actual_results["born_effective_charges"] = np.array(
                 results["apt"][self.batch.sr.atom_mask].reshape(-1, 3, 3),
                 dtype=np.float32,
+            )
+        if "dipole" in results:
+            actual_results["dipole"] = np.array(
+                results["dipole"][self.batch.sr.structure_mask].reshape(3)
+            )
+        if "bec_z" in results:
+            actual_results["bec_z"] = np.array(
+                results["bec_z"][self.batch.sr.atom_mask].reshape(-1, 3)
             )
 
         if self.add_offset:
