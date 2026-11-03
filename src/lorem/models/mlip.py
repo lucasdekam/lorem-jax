@@ -11,6 +11,7 @@ from lorem.models.backbone import (
     Initial,
     RadialCoefficients,
     Update,
+    EPSILON_0,
     degree_wise_repeat_last_axis,
     field_from_charge,
     field_harmonics,
@@ -48,8 +49,9 @@ class Lorem(nn.Module):
     # inferred from the cell.
     field_from_charge: bool = False
     slab_normal_axis: int = 2
-    # also predict bec_z = dF/dE_z, the Born effective charges' z column (one
-    # forward-mode pass over the force computation)
+    # also predict bec_z, the Born effective charges' z column (one forward-mode
+    # pass over the force computation): dF/dE_z with field_conditioning; with
+    # charge conditioning alone (A eps0) dF/dq, and d2E/dq2 on the same pass
     predict_bec: bool = False
 
     @property
@@ -367,6 +369,10 @@ class Lorem(nn.Module):
             results["work_function"] = (
                 batch_grads.inputs["total_charge"] * sr.structure_mask
             )
+            if self.predict_bec and not self.field_conditioning:
+                results["bec_z"], results["d2Edq2"] = self._charge_second_derivatives(
+                    params, batch
+                )
         if self.field_conditioning:
             # mu = -dE/dE, the cell dipole (e A) conjugate to the field
             dipole = -batch_grads.inputs["external_field"] * sr.structure_mask[:, None]
@@ -407,3 +413,28 @@ class Lorem(nn.Module):
         tangent = jnp.zeros_like(field).at[:, 2].set(1.0)
         _, bec_z = jax.jvp(forces_of, (field,), (tangent,))
         return bec_z * sr.atom_mask[:, None]
+
+    def _charge_second_derivatives(self, params, batch):
+        # Z*_{i,az} = (A eps0) dF_ia/dq = -(A eps0) d2E/(dr_ia dq): a charge q sets the
+        # field q/(A eps0), so this is the dimensionless Born charge that dF/dE_z is
+        # under field_conditioning, and razor's bec_z. d2E/dq2 comes on the same
+        # forward-over-reverse pass, one tangent per structure's charge.
+        sr = batch.sr
+
+        def first_derivatives(charge):
+            def total_energy(positions, charge):
+                b = batch._replace(
+                    sr=sr._replace(positions=positions),
+                    inputs={**batch.inputs, "total_charge": charge},
+                )
+                return self.energy(params, b)[0]
+
+            return jax.grad(total_energy, argnums=(0, 1))(sr.positions, charge)
+
+        charge = batch.inputs["total_charge"]
+        _, (d2E_drdq, d2E_dq2) = jax.jvp(
+            first_derivatives, (charge,), (jnp.ones_like(charge),)
+        )
+        area = jnp.linalg.norm(jnp.cross(sr.cell[:, 0], sr.cell[:, 1]), axis=-1)
+        scale = (area * EPSILON_0)[sr.atom_to_structure][:, None]
+        return -d2E_drdq * scale * sr.atom_mask[:, None], d2E_dq2 * sr.structure_mask

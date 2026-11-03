@@ -249,3 +249,52 @@ def test_work_function_includes_the_field_path(water_slab_charge):
     e_p, _ = run(atoms, q + h)
     e_m, _ = run(atoms, q - h)
     np.testing.assert_allclose(wf, (e_p - e_m) / (2 * h), rtol=2e-3, atol=1e-4)
+
+
+@pytest.mark.parametrize("field_from_charge", [False, True])
+def test_charge_second_derivatives(field_from_charge):
+    # bec_z = (A eps0) dF/dq and d2Edq2 = d2E/dq2, against differences of the forces and
+    # the work function in q
+    from lorem.models.backbone import EPSILON_0
+
+    model = Lorem(
+        cutoff=5.0,
+        num_features=8,
+        num_spherical_features=2,
+        num_radial=4,
+        max_degree=2,
+        max_degree_lr=1,
+        num_message_passing=1,
+        charge_conditioning=True,
+        field_from_charge=field_from_charge,
+        predict_bec=True,
+    )
+    params = model.init(jax.random.key(5), *model.dummy_inputs())
+    atoms = molecule("H2O")
+    atoms.rotate(37, "x")
+    atoms.set_cell([9.0, 9.5, 20.0])
+    atoms.center()
+    atoms.pbc = True
+    predict = jax.jit(model.predict)
+
+    def run(q):
+        a = atoms.copy()
+        a.info["total_charge"] = q
+        sample = to_sample(a, model.cutoff, keys=(), inputs=model.inputs, properties=PROPERTIES)
+        batch = to_batch([sample], [], inputs=model.inputs, properties=PROPERTIES)
+        out = predict(params, jax.tree.map(jnp.asarray, batch))
+        n = len(a)
+        return (np.asarray(out["forces"][:n]), float(out["work_function"][0]),
+                np.asarray(out["bec_z"][:n]), float(out["d2Edq2"][0]))
+
+    # a fourth-order stencil: the untrained model bends in q, so a centred difference
+    # carries an O(h^2) error of ~1% at h = 0.01
+    q, h = 0.3, 1e-2
+    _, _, bec, d2 = run(q)
+    (f_p, w_p, *_), (f_m, w_m, *_) = run(q + h), run(q - h)
+    (f_pp, w_pp, *_), (f_mm, w_mm, *_) = run(q + 2 * h), run(q - 2 * h)
+    d2_fd = (8 * (w_p - w_m) - (w_pp - w_mm)) / (12 * h)
+    fd = 9.0 * 9.5 * EPSILON_0 * (8 * (f_p - f_m) - (f_pp - f_mm)) / (12 * h)
+    np.testing.assert_allclose(d2, d2_fd, rtol=1e-3, atol=1e-4)
+    np.testing.assert_allclose(bec, fd, atol=1e-3 * np.abs(fd).max() + 1e-5)
+    assert np.abs(bec).max() > 0
