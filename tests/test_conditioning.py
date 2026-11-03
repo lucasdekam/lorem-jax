@@ -176,3 +176,76 @@ def test_calculator_reports_dipole():
         atoms.calc = calc
         assert np.all(np.isfinite(atoms.get_forces()))
         assert calc.get_property("dipole", atoms).shape == (3,)
+
+
+# -- the field from the charge --
+
+
+def test_field_from_charge_values():
+    from lorem.models.backbone import EPSILON_0, field_from_charge
+
+    cell = jnp.array([np.diag([10.0, 8.0, 30.0]), np.zeros((3, 3))])
+    E = field_from_charge(jnp.array([0.4, 0.4]), cell, 2)
+    np.testing.assert_allclose(E[0], [0.0, 0.0, 0.4 / (EPSILON_0 * 80.0)], rtol=1e-6)
+    np.testing.assert_allclose(E[1], 0.0)  # padding: no cell, no field
+    grad = jax.grad(lambda c: field_from_charge(jnp.array([0.4, 0.4]), c, 2).sum())(cell)
+    assert np.all(np.isfinite(grad))
+
+
+@pytest.fixture(scope="module")
+def water_slab_charge():
+    model = Lorem(
+        cutoff=5.0,
+        num_features=8,
+        num_spherical_features=2,
+        num_radial=4,
+        max_degree=2,
+        max_degree_lr=1,
+        num_message_passing=1,
+        charge_conditioning=True,
+        field_from_charge=True,
+    )
+    params = model.init(jax.random.key(3), *model.dummy_inputs())
+    atoms = molecule("H2O")
+    atoms.rotate(37, "x")  # a dipole along z, so the field couples at first order
+    atoms.set_cell([9.0, 9.5, 20.0])
+    atoms.center()
+    atoms.pbc = True
+    predict = jax.jit(model.predict)
+
+    def run(atoms, q):
+        atoms = atoms.copy()
+        atoms.info["total_charge"] = q
+        sample = to_sample(
+            atoms, model.cutoff, keys=(), inputs=model.inputs, properties=PROPERTIES
+        )
+        batch = to_batch([sample], [], inputs=model.inputs, properties=PROPERTIES)
+        out = predict(params, jax.tree.map(jnp.asarray, batch))
+        return float(out["energy"][0]), float(out["work_function"][0])
+
+    return model, atoms, run
+
+
+def test_field_from_charge_needs_charge_only():
+    model = Lorem(charge_conditioning=True, field_from_charge=True, field_conditioning=True)
+    with pytest.raises(ValueError):
+        model.init(jax.random.key(0), *model.dummy_inputs())
+
+
+def test_field_from_charge_sees_the_mirror(water_slab_charge):
+    # the charge's field points along +z, so mirroring the water changes E at q != 0,
+    # and at q = 0 the model is plain O(3)-invariant again
+    _, atoms, run = water_slab_charge
+    mir = atoms.copy()
+    mir.positions[:, 2] = atoms.cell[2, 2] - atoms.positions[:, 2]
+    assert abs(run(mir, 0.05)[0] - run(atoms, 0.05)[0]) > 1e-6
+    np.testing.assert_allclose(run(mir, 0.0)[0], run(atoms, 0.0)[0], atol=1e-5)
+
+
+def test_work_function_includes_the_field_path(water_slab_charge):
+    _, atoms, run = water_slab_charge
+    q, h = 0.02, 1e-3
+    _, wf = run(atoms, q)
+    e_p, _ = run(atoms, q + h)
+    e_m, _ = run(atoms, q - h)
+    np.testing.assert_allclose(wf, (e_p - e_m) / (2 * h), rtol=2e-3, atol=1e-4)

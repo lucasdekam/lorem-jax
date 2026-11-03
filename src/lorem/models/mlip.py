@@ -12,6 +12,7 @@ from lorem.models.backbone import (
     RadialCoefficients,
     Update,
     degree_wise_repeat_last_axis,
+    field_from_charge,
     field_harmonics,
     spherical_norm_last_axis,
 )
@@ -39,6 +40,14 @@ class Lorem(nn.Module):
     # external_field (V/A, a 3-vector per structure): FiLM on |E|^2, plus a
     # tensor product of the spherical features with E, linear in E
     field_conditioning: bool = False
+    # with charge_conditioning instead of field_conditioning: couple the spherical
+    # features to the field the charge itself makes, E = Q / (eps0 A) along
+    # slab_normal_axis (an electrode charged Q, its counter charge -Q on the +axis
+    # side). FiLM stays on Q alone, since |E|^2 is a function of Q, and dE/dQ, the
+    # work function, then includes the field path. The axis is explicit, never
+    # inferred from the cell.
+    field_from_charge: bool = False
+    slab_normal_axis: int = 2
     # also predict bec_z = dF/dE_z, the Born effective charges' z column (one
     # forward-mode pass over the force computation)
     predict_bec: bool = False
@@ -139,6 +148,14 @@ class Lorem(nn.Module):
         )
         nodes_scalar = Update(d)(nodes_scalar, updates, atom_mask)
 
+        if self.field_from_charge and (
+            not self.charge_conditioning or self.field_conditioning
+        ):
+            raise ValueError(
+                "field_from_charge needs charge_conditioning and replaces field_conditioning"
+            )
+        couple_field = self.field_conditioning or self.field_from_charge
+
         conditions = []
         if self.charge_conditioning:
             conditions.append(inputs["total_charge"][sr.atom_to_structure])
@@ -146,6 +163,9 @@ class Lorem(nn.Module):
             E_i = inputs["external_field"][sr.atom_to_structure] * atom_mask[..., None]
             # |E|^2, not |E|: smooth at E=0, so -dE/dE (the dipole) is defined there
             conditions.append(jnp.sum(E_i**2, axis=-1))
+        if self.field_from_charge:
+            E_s = field_from_charge(inputs["total_charge"], cell, self.slab_normal_axis)
+            E_i = E_s[sr.atom_to_structure] * atom_mask[..., None]
         if conditions:
             c_i = jnp.stack(conditions, axis=-1)
             nodes_scalar = FiLM(d)(c_i, nodes_scalar, atom_mask)
@@ -168,7 +188,7 @@ class Lorem(nn.Module):
             nodes_spherical
         )
 
-        if self.field_conditioning:
+        if couple_field:
             # -- couple the field into the spherical features --
             # residual, so everything downstream (norms, message passing, LR
             # charges) sees it; linear in E, so it is zero at zero field
@@ -180,7 +200,7 @@ class Lorem(nn.Module):
         # -- mix equivariant information into scalar node features --
         norms = spherical_norm_last_axis(nodes_spherical, max_degree)
         updates = (norms * l_factors[None, None, :, None]).reshape(num_atoms, -1)
-        if self.field_conditioning:
+        if couple_field:
             # the l=0 output, E . (l=1 features): signed in E, which a norm is not
             updates = jnp.concatenate([updates, field_coupled[:, 0, 0, :]], axis=-1)
 

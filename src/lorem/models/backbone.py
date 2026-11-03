@@ -266,6 +266,21 @@ class FiLM(nn.Module):
         return (1.0 + gamma) * x + beta  # identity at c=0
 
 
+EPSILON_0 = 5.5263494e-3  # vacuum permittivity, e / (V A)
+
+
+def field_from_charge(Q, cell, axis):
+    # the field (V/A) of a charge Q (e) on an electrode against a counter charge -Q
+    # on its +axis side: E = Q / (eps0 A) along that axis, A = |a x b| of the two
+    # other cell vectors. Zero for a structure without a cell (padding), whose
+    # area is guarded so the gradient stays finite.
+    a, b = (cell[:, k] for k in range(3) if k != axis)
+    area2 = jnp.sum(jnp.cross(a, b) ** 2, axis=-1)
+    area = jnp.sqrt(jnp.where(area2 > 0, area2, 1.0))
+    E = jnp.where(area2 > 0, Q / (EPSILON_0 * area), 0.0)
+    return E[:, None] * jax.nn.one_hot(axis, 3, dtype=E.dtype)
+
+
 def field_harmonics(E_i):
     # the field as an l=1 irrep, linear in E: r_is_normalized=True skips the
     # normalisation, so the l=1 slots are the field itself (in e3x's ordering)
