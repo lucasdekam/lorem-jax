@@ -1,4 +1,4 @@
-"""coulomb_energy: the long-range charges' own Coulomb energy added to Lorem's readout."""
+"""coulomb_energy: the long-range charges' own Coulomb energy added to Lorem's readout, gated."""
 
 import numpy as np
 import jax
@@ -69,24 +69,29 @@ def small(**kwargs):
                  max_degree=2, max_degree_lr=0, num_message_passing=1, **kwargs)
 
 
-def test_off_by_default_and_no_new_parameters():
+def test_off_by_default_and_the_gate_is_the_only_new_parameter():
     assert Lorem().coulomb_energy is False
     off, on = small(), small(coulomb_energy=True)
     p_off = off.init(jax.random.key(0), *off.dummy_inputs())
     p_on = on.init(jax.random.key(0), *on.dummy_inputs())
+    gate = p_on["params"].pop("coulomb_gate")
+    assert np.asarray(gate).shape == () and float(gate) == 0.0
     assert jax.tree.structure(p_off) == jax.tree.structure(p_on)
     for a, b in zip(jax.tree.leaves(p_off), jax.tree.leaves(p_on)):
         np.testing.assert_array_equal(a, b)
 
 
-def test_energy_gains_exactly_the_coulomb_energy():
+def with_gate(params, value):
+    return {"params": {**params["params"], "coulomb_gate": jnp.asarray(value, jnp.float32)}}
+
+
+def test_energy_gains_exactly_the_gated_coulomb_energy():
     off, on = small(), small(coulomb_energy=True)
     params = off.init(jax.random.key(0), *off.dummy_inputs())
     w = water_slab()
     b = batch_of(w)
     args = (b.atomic_numbers, b.sr, b.nopbc, b.pbc, b.inputs)
     e_off, state = off.apply(params, *args, capture_intermediates=True, mutable=["intermediates"])
-    e_on = on.apply(params, *args)
     # the scalar-charge head: the one MLP whose hidden layer is 2d wide
     (head,) = [k for k, v in params["params"].items()
                if k.startswith("MLP") and v["Dense_0"]["kernel"].shape[1] == 2 * off.num_features]
@@ -94,9 +99,14 @@ def test_energy_gains_exactly_the_coulomb_energy():
     q = jnp.asarray(q * np.asarray(b.sr.atom_mask), jnp.float32)
     phi = Ewald().potentials(q, b.sr, b.nopbc, b.pbc)
     mask = np.asarray(b.sr.atom_mask)
-    np.testing.assert_allclose(np.asarray(e_on - e_off)[mask], np.asarray(COULOMB * q * phi)[mask],
-                               rtol=1e-4, atol=1e-6)
-    assert np.abs(np.asarray(e_on - e_off)[mask]).max() > 1e-4  # the term is not trivially zero
+    coulomb = np.asarray(COULOMB * q * phi)[mask]
+    assert np.abs(coulomb).max() > 1e-4  # the term is not trivially zero
+
+    # at init (gate 0) the model is the one without the term
+    np.testing.assert_array_equal(np.asarray(on.apply(with_gate(params, 0.0), *args)), np.asarray(e_off))
+    for g in (1.0, 0.5):
+        e_on = on.apply(with_gate(params, g), *args)
+        np.testing.assert_allclose(np.asarray(e_on - e_off)[mask], g * coulomb, rtol=1e-4, atol=1e-6)
 
 
 def test_needs_lr():
