@@ -22,6 +22,8 @@ from lorem.models.backbone import (
 )
 from lorem.transforms import ToBatch, ToSample
 
+COULOMB = 1.0 / (4.0 * jnp.pi * EPSILON_0)  # eV A / e^2, 14.3996
+
 
 class Lorem(nn.Module):
     cutoff: float = 5.0
@@ -53,6 +55,12 @@ class Lorem(nn.Module):
     # pass over the force computation): dF/dE_z with field_conditioning; with
     # charge conditioning alone (A eps0) dF/dq, and d2E/dq2 on the same pass
     predict_bec: bool = False
+    # with lr: add the scalar charges' own Coulomb energy, q_i phi_i per atom, to the
+    # readout. Without it the long-range potentials reach the energy only through
+    # the MLP of the updated features, which leaves e.g. a water's interaction with
+    # its lateral images out entirely (lorem-q-work, water_Ne_single). No new
+    # parameters, so checkpoints trained without it load and run unchanged.
+    coulomb_energy: bool = False
 
     @property
     def inputs(self):
@@ -156,6 +164,8 @@ class Lorem(nn.Module):
             raise ValueError(
                 "field_from_charge needs charge_conditioning and replaces field_conditioning"
             )
+        if self.coulomb_energy and not self.lr:
+            raise ValueError("coulomb_energy needs lr: it is the long-range charges' energy")
         couple_field = self.field_conditioning or self.field_from_charge
 
         conditions = []
@@ -282,6 +292,11 @@ class Lorem(nn.Module):
                 in_axes=-1,
                 out_axes=-1,
             )(charges)
+
+            if self.coulomb_energy:
+                # jaxpme's potentials carry the 1/2 of the pair sum: sum_i q_i phi_i is
+                # the Coulomb energy, in e^2/A for charges in e
+                energy += COULOMB * scalar_charges[..., 0] * potentials[..., 0]
 
             scalar_potential = potentials[..., 0][..., None]
             spherical_potential = potentials[..., 1:].reshape(num_atoms, 1, -1, 1)
