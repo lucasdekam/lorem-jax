@@ -51,6 +51,12 @@ class Lorem(nn.Module):
     # inferred from the cell.
     field_from_charge: bool = False
     slab_normal_axis: int = 2
+    # with either field path: scale the field coupling by a learned scalar, zero at
+    # init, so the model starts as the one without it. Ungated, field_from_charge on
+    # stepped Pt took over the water's share of dE/dQ from the start, and the
+    # long-range route that carries the step never formed (lorem-q-work,
+    # experiments/water_pt_abacus, "Diagnostics of LOREM-V's flat step")
+    field_gate: bool = False
     # also predict bec_z, the Born effective charges' z column (one forward-mode
     # pass over the force computation): dF/dE_z with field_conditioning; with
     # charge conditioning alone (A eps0) dF/dq, and d2E/dq2 on the same pass
@@ -172,6 +178,8 @@ class Lorem(nn.Module):
         if self.coulomb_energy and not self.lr:
             raise ValueError("coulomb_energy needs lr: it is the long-range charges' energy")
         couple_field = self.field_conditioning or self.field_from_charge
+        if self.field_gate and not couple_field:
+            raise ValueError("field_gate needs field_conditioning or field_from_charge")
 
         conditions = []
         if self.charge_conditioning:
@@ -212,6 +220,8 @@ class Lorem(nn.Module):
             field_coupled = e3x.nn.Tensor(
                 max_degree=max_degree, include_pseudotensors=False
             )(nodes_spherical, e3x.nn.Dense(s, use_bias=False)(field_harmonics(E_i)))
+            if self.field_gate:
+                field_coupled *= self.param("field_coupling_gate", nn.initializers.zeros, ())
             nodes_spherical = nodes_spherical + field_coupled
 
         # -- mix equivariant information into scalar node features --

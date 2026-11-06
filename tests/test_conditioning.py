@@ -251,6 +251,55 @@ def test_work_function_includes_the_field_path(water_slab_charge):
     np.testing.assert_allclose(wf, (e_p - e_m) / (2 * h), rtol=2e-3, atol=1e-4)
 
 
+def gated_slab_model(**kwargs):
+    return Lorem(cutoff=5.0, num_features=8, num_spherical_features=2, num_radial=4, max_degree=2,
+                 max_degree_lr=1, num_message_passing=1, charge_conditioning=True,
+                 field_from_charge=True, **kwargs)
+
+
+def test_field_gate_is_the_only_new_parameter_and_starts_at_zero():
+    assert Lorem().field_gate is False
+    off, on = gated_slab_model(), gated_slab_model(field_gate=True)
+    p_off = off.init(jax.random.key(0), *off.dummy_inputs())
+    p_on = on.init(jax.random.key(0), *on.dummy_inputs())
+    gate = p_on["params"].pop("field_coupling_gate")
+    assert np.asarray(gate).shape == () and float(gate) == 0.0
+    assert jax.tree.structure(p_off) == jax.tree.structure(p_on)
+    for a, b in zip(jax.tree.leaves(p_off), jax.tree.leaves(p_on)):
+        np.testing.assert_array_equal(a, b)
+
+
+def test_field_gate_scales_the_coupling(water_slab_charge):
+    # gate 0: the field path is off, so dE/dQ is the FiLM's alone (the model with the
+    # coupling's tensor product zeroed); gate 1: exactly the ungated model
+    _, atoms, _ = water_slab_charge
+    off, on = gated_slab_model(), gated_slab_model(field_gate=True)
+    params = off.init(jax.random.key(3), *off.dummy_inputs())
+    atoms = atoms.copy()
+    atoms.info["total_charge"] = 0.05
+    sample = to_sample(atoms, off.cutoff, keys=(), inputs=off.inputs, properties=PROPERTIES)
+    batch = jax.tree.map(jnp.asarray, to_batch([sample], [], inputs=off.inputs, properties=PROPERTIES))
+
+    def predict(model, p):
+        out = model.predict(p, batch)
+        return float(out["energy"][0]), float(out["work_function"][0])
+
+    gated = lambda g: {"params": {**params["params"], "field_coupling_gate": jnp.float32(g)}}  # noqa: E731
+    np.testing.assert_allclose(predict(on, gated(1.0)), predict(off, params), rtol=1e-6, atol=1e-6)
+    # the coupling is the Tensor that takes the field harmonics: the last Tensor before
+    # the message pass, Tensor_0 here
+    no_coupling = {"params": {**params["params"], "Tensor_0": jax.tree.map(jnp.zeros_like,
+                                                                          params["params"]["Tensor_0"])}}
+    np.testing.assert_allclose(predict(on, gated(0.0)), predict(off, no_coupling), rtol=1e-6, atol=1e-6)
+    assert abs(predict(on, gated(0.0))[1] - predict(off, params)[1]) > 1e-6  # the gate does something
+
+
+def test_field_gate_needs_a_field_path():
+    model = Lorem(charge_conditioning=True, field_gate=True)
+    with pytest.raises(ValueError):
+        model.init(jax.random.key(0), *model.dummy_inputs())
+
+
 @pytest.mark.parametrize("field_from_charge", [False, True])
 def test_charge_second_derivatives(field_from_charge):
     # bec_z = (A eps0) dF/dq and d2Edq2 = d2E/dq2, against differences of the forces and
